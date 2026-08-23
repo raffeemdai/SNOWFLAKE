@@ -737,3 +737,1110 @@ This is a **"diff" pattern** — commonly used far beyond Snowflake (in software
 | 6 | DDL Change Tracking | `INFORMATION_SCHEMA.COLUMNS`, snapshot comparison, `LEFT JOIN` | Building a "diff"-based audit trail for schema changes |
 
 **Common thread across all scenarios:** Snowflake **Stored Procedures** + **Dynamic SQL** (`EXECUTE IMMEDIATE`) are the backbone of almost every real-time automation scenario — they let you build SQL statements as text at runtime and then execute them, which is essential whenever table names, file paths, or column lists aren't known ahead of time.
+
+
+
+
+# Snowflake Real-Time Scenarios — Explained Simply (With Full Code Walkthrough)
+
+> Covers 4 real interview-style Snowflake projects, explained in plain language:
+> 1. Automate Data Load & Validation in a Single Step (Stored Procedure)
+> 2. Real-Time Pipeline — Snowpipe + Dynamic Tables + Alerts
+> 3. Load Excel Files into Snowflake Using Snowpark (Python)
+> 4. Automate Table Creation & Data Load from S3 to Snowflake Using Snowpark (Python + Task + Email Alerts)
+
+Each scenario follows: **Business Problem → Concept → Full Code → Line-by-Line Explanation → Interview Takeaways**
+
+---
+
+# Scenario 1: Automate Data Load & Validation in a Single Step
+
+## The Business Problem
+
+Imagine a client sends you a CSV file every day. The old, painful way of handling this:
+
+1. Load the raw file into a table (bronze/raw layer).
+2. Later, someone notices bad data — missing phone numbers, duplicate customer IDs.
+3. You now have to manually debug, clean, delete bad rows, and reload — wasting hours.
+
+**The better way:** catch the problems *before* the data ever reaches your final table. Load the file into a **temporary staging table** first, run validation checks there, and only push the data into the real table if it passes. If anything fails — either the load itself or the validation — log it to an audit table so nothing silently disappears.
+
+## The Design (Plain English)
+
+```
+Stage File (CSV) 
+     │
+     ▼
+Temporary Table  ──► Run checks: null values? duplicates? row count zero?
+     │
+     ├── ✅ PASS ──► Insert into Final Table (CUSTOMER_DATA)
+     │
+     └── ❌ FAIL ──► Do NOT insert, just log the reason
+     │
+     ▼
+Always write outcome (success or failure) to AUDIT_LOG table
+```
+
+This whole thing is wrapped inside **one Stored Procedure**, so it runs as a single automated unit — not five separate manual steps.
+
+## Full Code
+
+```sql
+CREATE OR REPLACE PROCEDURE LOAD_AND_VALIDATE()
+RETURNS VARCHAR()
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    temp_table_name STRING;
+    total_rows_loaded INT DEFAULT 0;
+    duplicate_rows INT DEFAULT 0;
+    null_rows INT DEFAULT 0;
+    status VARCHAR(50);
+    error_message VARCHAR();
+    result_message STRING;
+
+BEGIN
+    temp_table_name := 'TEMP_CUST_DATA';
+    status := 'Failed';
+    error_message := NULL;
+
+    -- Drop temp table if it exists
+    CREATE OR REPLACE TEMPORARY TABLE IDENTIFIER(:temp_table_name) (
+       C_CUSTKEY    INT,
+       C_NAME       STRING,
+       C_ADDRESS    STRING,
+       C_NATIONKEY  INT,
+       C_PHONE      STRING,
+       C_ACCTBAL    INT,
+       C_MKTSEGMENT STRING,
+       C_COMMENT    STRING
+    );
+
+    BEGIN
+        -- Step 1: Load data into temporary table
+        COPY INTO IDENTIFIER(:temp_table_name)
+        FROM @SOURCE_DATA 
+        FILE_FORMAT = (FORMAT_NAME='CSVONE')
+        ON_ERROR = 'ABORT_STATEMENT';
+
+        -- Step 2: Validation checks
+        total_rows_loaded := (SELECT COUNT(*) FROM IDENTIFIER(:temp_table_name));
+
+        null_rows := (
+            SELECT COUNT(*) FROM IDENTIFIER(:temp_table_name)
+            WHERE C_PHONE IS NULL OR C_NATIONKEY IS NULL
+        );
+
+        duplicate_rows := (
+            SELECT COUNT(*)
+            FROM (
+                SELECT C_CUSTKEY,
+                       ROW_NUMBER() OVER (PARTITION BY C_CUSTKEY ORDER BY C_CUSTKEY) AS rn
+                FROM IDENTIFIER(:temp_table_name)
+            ) a
+            WHERE rn > 1
+        );
+
+        IF (null_rows = 0 AND duplicate_rows = 0 AND total_rows_loaded > 0) THEN
+            INSERT INTO CUSTOMER_DATA (
+                C_CUSTKEY, C_NAME, C_ADDRESS, C_NATIONKEY, C_PHONE, C_ACCTBAL, C_MKTSEGMENT, C_COMMENT
+            )
+            SELECT C_CUSTKEY, C_NAME, C_ADDRESS, C_NATIONKEY, C_PHONE, C_ACCTBAL, C_MKTSEGMENT, C_COMMENT  
+            FROM IDENTIFIER(:temp_table_name);
+
+            status := 'Success';
+            result_message := 'Successfully loaded ' || total_rows_loaded || ' rows with no validation errors.';
+        ELSE
+            status := 'Failed - Validation Errors';
+            error_message := 'Validation failed. ' || null_rows || ' rows with nulls, ' || duplicate_rows || ' duplicate rows found.';
+            result_message := error_message;
+        END IF;
+
+    EXCEPTION
+        WHEN OTHER THEN
+            status := 'Failed - Execution Error';
+            error_message := SQLERRM;
+            result_message := error_message;
+    END;
+
+    -- Step 3: Log the outcome always
+    INSERT INTO AUDIT_LOG (
+        status, load_timestamp, rows_loaded, duplicate_rows, null_rows, error_message
+    )
+    VALUES (
+        :status, CURRENT_TIMESTAMP(), :total_rows_loaded, :duplicate_rows, :null_rows, :error_message
+    );
+
+    RETURN 'Procedure execution completed with status: ' || status || '. Message: ' || result_message;
+
+END;
+$$;
+
+CALL LOAD_AND_VALIDATE();
+```
+
+## Line-by-Line / Block-by-Block Explanation
+
+### 1. Procedure Declaration
+```sql
+CREATE OR REPLACE PROCEDURE LOAD_AND_VALIDATE()
+RETURNS VARCHAR()
+LANGUAGE SQL
+```
+This creates (or replaces) a **Snowflake Scripting stored procedure** called `LOAD_AND_VALIDATE`. It takes no input parameters, returns a `VARCHAR` (a text message summarizing what happened), and is written in plain SQL scripting (not Python/Java).
+
+### 2. Variable Declaration
+```sql
+DECLARE
+    temp_table_name STRING;
+    total_rows_loaded INT DEFAULT 0;
+    duplicate_rows INT DEFAULT 0;
+    null_rows INT DEFAULT 0;
+    status VARCHAR(50);
+    error_message VARCHAR();
+    result_message STRING;
+```
+Think of this as setting up "memory boxes" to hold values while the procedure runs — like local variables in any programming language. `total_rows_loaded`, `duplicate_rows`, and `null_rows` start at `0` by default, so if something skips them entirely, they're still safe numbers (not `NULL`).
+
+### 3. Initial Setup
+```sql
+temp_table_name := 'TEMP_CUST_DATA';
+status := 'Failed';
+error_message := NULL;
+```
+This sets a starting/default state: assume failure until proven otherwise (`status := 'Failed'`). This is a good defensive coding habit — if something unexpected happens and none of the later logic runs, you still log "Failed" instead of an empty/blank status.
+
+### 4. Create the Temporary Table
+```sql
+CREATE OR REPLACE TEMPORARY TABLE IDENTIFIER(:temp_table_name) (
+   C_CUSTKEY INT, C_NAME STRING, ... C_COMMENT STRING
+);
+```
+- `IDENTIFIER(:temp_table_name)` is a neat Snowflake trick: it lets you build a table name dynamically from a **variable** instead of hardcoding it. So if you ever wanted to reuse this procedure for a different table, you'd only change the variable, not the whole script.
+- It's a **TEMPORARY** table — meaning it exists only for the current session and disappears afterward. Perfect for a "scratch pad" table used just for validation, so it doesn't clutter your database permanently.
+
+### 5. Nested BEGIN...EXCEPTION Block (the safety net)
+```sql
+BEGIN
+    -- Step 1: Load data
+    COPY INTO ...
+    -- Step 2: Validation checks
+    ...
+EXCEPTION
+    WHEN OTHER THEN
+        status := 'Failed - Execution Error';
+        error_message := SQLERRM;
+        result_message := error_message;
+END;
+```
+This is exactly like a `try...catch` block in Python/Java. Everything risky (loading data, running checks) sits inside `BEGIN...END`. If **anything** throws an error — like a malformed CSV file breaking the `COPY INTO` — the `EXCEPTION WHEN OTHER` block catches it instead of crashing the whole procedure. `SQLERRM` automatically captures Snowflake's actual error message, so you don't have to guess what went wrong.
+
+**This is the single most important design choice in this procedure** — it guarantees the procedure never dies silently. Whatever happens (data issue OR system issue), you always get a clean status and message at the end.
+
+### 6. Step 1 — Load Data (COPY INTO)
+```sql
+COPY INTO IDENTIFIER(:temp_table_name)
+FROM @SOURCE_DATA 
+FILE_FORMAT = (FORMAT_NAME='CSVONE')
+ON_ERROR = 'ABORT_STATEMENT';
+```
+This loads the CSV sitting in the stage `@SOURCE_DATA` into the temporary table.
+- `FILE_FORMAT = (FORMAT_NAME='CSVONE')` tells Snowflake how to parse the file (delimiter, header row, etc. — pre-defined as a named file format object).
+- `ON_ERROR = 'ABORT_STATEMENT'` means: if even one row is malformed, stop the entire load immediately and throw an error (which then gets caught by the `EXCEPTION` block above). This is intentional — we want zero tolerance for structurally broken files.
+
+### 7. Step 2 — Validation Checks
+
+**Total row count:**
+```sql
+total_rows_loaded := (SELECT COUNT(*) FROM IDENTIFIER(:temp_table_name));
+```
+Simple sanity check — did we actually get any rows at all?
+
+**Null check:**
+```sql
+null_rows := (
+    SELECT COUNT(*) FROM IDENTIFIER(:temp_table_name)
+    WHERE C_PHONE IS NULL OR C_NATIONKEY IS NULL
+);
+```
+Counts how many rows are missing critical fields (`C_PHONE` or `C_NATIONKEY`). You can extend this to check any column you consider mandatory.
+
+**Duplicate check:**
+```sql
+duplicate_rows := (
+    SELECT COUNT(*)
+    FROM (
+        SELECT C_CUSTKEY,
+               ROW_NUMBER() OVER (PARTITION BY C_CUSTKEY ORDER BY C_CUSTKEY) AS rn
+        FROM IDENTIFIER(:temp_table_name)
+    ) a
+    WHERE rn > 1
+);
+```
+This is the classic **"find duplicates using ROW_NUMBER()"** pattern:
+- `PARTITION BY C_CUSTKEY` groups rows by customer key.
+- `ROW_NUMBER() OVER (...)` numbers each row within its group: 1, 2, 3...
+- Any row numbered `rn > 1` is a *repeat* of a customer key that already appeared once — i.e., a duplicate.
+- Counting those gives you the total number of duplicate rows.
+
+### 8. Decision — Insert or Reject
+```sql
+IF (null_rows = 0 AND duplicate_rows = 0 AND total_rows_loaded > 0) THEN
+    INSERT INTO CUSTOMER_DATA (...)
+    SELECT ... FROM IDENTIFIER(:temp_table_name);
+    status := 'Success';
+    result_message := 'Successfully loaded ' || total_rows_loaded || ' rows with no validation errors.';
+ELSE
+    status := 'Failed - Validation Errors';
+    error_message := 'Validation failed. ' || null_rows || ' rows with nulls, ' || duplicate_rows || ' duplicate rows found.';
+    result_message := error_message;
+END IF;
+```
+This is the actual **gate**: data only moves from the temp table into the real `CUSTOMER_DATA` table if *all three* conditions are true — no nulls, no duplicates, and at least one row was loaded. If any condition fails, nothing is inserted; instead, a descriptive error message is built explaining exactly what failed and by how many rows. This is far more useful for debugging than a generic "load failed."
+
+### 9. Always Log to Audit Table
+```sql
+INSERT INTO AUDIT_LOG (
+    status, load_timestamp, rows_loaded, duplicate_rows, null_rows, error_message
+)
+VALUES (
+    :status, CURRENT_TIMESTAMP(), :total_rows_loaded, :duplicate_rows, :null_rows, :error_message
+);
+```
+This line runs **no matter what happened above** — success, validation failure, or execution error. That's the whole point of putting it *outside* the inner `BEGIN...EXCEPTION` block: this INSERT is unconditional, so you always have a full history of every run, which is invaluable when troubleshooting "why didn't yesterday's load work?"
+
+### 10. Return a Summary
+```sql
+RETURN 'Procedure execution completed with status: ' || status || '. Message: ' || result_message;
+```
+The procedure returns one final readable string so whoever (or whatever orchestration tool) calls it immediately knows the outcome without needing to query the audit table separately.
+
+## What the Video Demonstrated
+
+1. **Ran with a broken file format** → got an *execution error* (`found while expecting record delimiter`) because the file format didn't match the actual CSV structure. Logged as `Failed - Execution Error`.
+2. **Fixed the file format, ran again** → this time the COPY succeeded, but validation caught 2 null rows and 1 duplicate → logged as `Failed - Validation Errors`, and **zero rows were inserted** into `CUSTOMER_DATA`.
+3. **Fixed the source data and re-uploaded the file** → ran again → all validations passed → **126,000+ rows successfully inserted**, logged as `Success`.
+
+## Interview Takeaways
+
+| Concept | Why It Matters |
+|---|---|
+| `IDENTIFIER(:var)` | Lets you dynamically reference table/object names using variables — makes procedures reusable |
+| `TEMPORARY` table | Safe scratch space for staging/validation that auto-cleans itself, doesn't pollute production schemas |
+| Nested `BEGIN...EXCEPTION` | Mimics try/catch; ensures the procedure never crashes silently and always produces a status |
+| `SQLERRM` | Built-in variable that captures the actual system error message inside an exception handler |
+| `ROW_NUMBER() OVER (PARTITION BY ...)` | The standard SQL pattern for detecting duplicate records |
+| Audit logging outside the try block | Guarantees you always get a log entry regardless of success/failure — critical for production pipelines |
+| "Validate before you commit" pattern | A very common real-world data engineering pattern — catch issues at ingestion, not after |
+
+---
+
+# Scenario 2: Real-Time Pipeline — Snowpipe + Dynamic Tables + Alerts
+
+## The Business Problem
+
+A company has an S3 bucket where customer and item files land continuously. The requirement:
+1. Ingest files automatically (Snowpipe) into a **raw/staging layer**.
+2. Build a **clean layer** on top using transformations — e.g., "only keep the latest customer record" and "only keep the item with the highest price."
+3. Combine the cleaned tables into one **final reporting table** with a derived metric (price per item).
+4. If the final table's calculation ever fails (e.g., division by zero), **automatically email someone** instead of relying on manual monitoring.
+
+This entire scenario is built using **Dynamic Tables**, which is Snowflake's way of automatically keeping downstream tables refreshed as source data changes — without you writing and scheduling your own transformation jobs.
+
+## The Design (Plain English)
+
+```
+S3 Bucket (customer.csv, item.csv)
+        │  (Snowpipe — not shown in detail here, assumed already ingesting)
+        ▼
+STG_CUSTOMER, ITEM   (raw staging tables)
+        │
+        ▼
+CUSTOMER_DT   (Dynamic Table: dedupe → keep latest record per customer)
+ITEM_DT       (Dynamic Table: dedupe → keep highest-price item per customer)
+        │
+        ▼
+CUST_ITEM_DT  (Dynamic Table: join CUSTOMER_DT + ITEM_DT, calculate price per item)
+        │
+        ▼
+If refresh fails → ALERT object checks refresh history every 1 min
+        │
+        ▼
+   Sends email via Notification Integration
+```
+
+## Full Code
+
+```sql
+CREATE OR REPLACE SCHEMA PIPELINE;
+
+-- Create Customer Table
+CREATE OR REPLACE TABLE STG_Customer (
+    CUST_ID STRING,
+    CUST_NAME STRING,
+    OUTSTANDING_AMT NUMBER,
+    CRID STRING,
+    LOCATION STRING,
+    CUST_CREATED DATE
+);
+
+-- Insert Data
+INSERT INTO STG_Customer (CUST_ID, CUST_NAME, OUTSTANDING_AMT, CRID, LOCATION, CUST_CREATED) VALUES
+('C-101', 'Raman', 500, 'ABVC', 'LA', '2025-08-11'),
+('C-101', 'Raman', 500, 'ABVC', 'LA', '2025-08-12'), -- in the cleansed layer we should have latest record
+('C-102', 'Rahul', 200, 'XYZ', 'AF', '2025-08-14'),
+('C-103', 'Anshi', 5000, 'MNCD', 'GA', '2025-08-15');
+
+CREATE OR REPLACE TABLE ITEM (
+    CUST_ID STRING,
+    ITEM_ID STRING,
+    ITEM_CATEGORY STRING,
+    ITEM_STATUS STRING,
+    COUNTS NUMBER,
+    PRICE NUMBER
+);
+
+INSERT INTO ITEM (CUST_ID, ITEM_ID, ITEM_CATEGORY, ITEM_STATUS, COUNTS, PRICE) VALUES
+('C-101', 'a-101', 'Printer', 'Active', 1, 100),
+('C-101', 'a-101', 'Printer', 'Active', 4, 200), -- this row should be there 
+('C-102', 'a-103', 'Ink', 'Active', 2, 300),
+('C-103', 'a-103', 'Ribbon', 'Active', 3, 100),
+('C-103', 'a-103', 'Ribbon', 'Active', 2, 200); -- We need this row as this is highest price 
+
+-- STEP 2: cleansed layer
+CREATE OR REPLACE DYNAMIC TABLE CUSTOMER_DT
+  TARGET_LAG = DOWNSTREAM
+  WAREHOUSE = COMPUTE_WH
+  INITIALIZE = ON_CREATE
+AS
+  SELECT * FROM STG_CUSTOMER 
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY CUST_ID ORDER BY CUST_CREATED DESC) = 1;
+
+CREATE OR REPLACE DYNAMIC TABLE ITEM_DT
+  TARGET_LAG = DOWNSTREAM
+  WAREHOUSE = COMPUTE_WH
+AS
+  SELECT * FROM (
+    SELECT *,
+           ROW_NUMBER() OVER (PARTITION BY CUST_ID ORDER BY PRICE DESC) AS rn
+    FROM ITEM 
+  ) t
+  WHERE rn = 1;
+
+-- STEP 3: Final Dynamic table calculating price per item
+CREATE OR REPLACE DYNAMIC TABLE CUST_ITEM_DT
+  TARGET_LAG = '1 MINUTES'
+  WAREHOUSE = COMPUTE_WH
+AS
+  SELECT c.cust_id, c.cust_name, c.crid, c.location, c.cust_created,
+         a.item_id, a.item_category, a.item_status, a.price, a.counts,
+         ROUND(a.price / a.counts, 2) AS Price_Per_item
+  FROM CUSTOMER_DT c, ITEM_DT a
+  WHERE c.cust_id = a.cust_id;
+
+-- Simulate new incoming data (this would come from S3 via Snowpipe in real life)
+INSERT INTO STG_CUSTOMER (CUST_ID, CUST_NAME, OUTSTANDING_AMT, CRID, LOCATION, CUST_CREATED)
+VALUES 
+('c-102', 'Megan', 3500, 'XYAZ', 'AF', '2023-08-15'),
+('c-104', 'Vincet', 5000, 'ABDF', 'TX', '2023-08-15');
+
+INSERT INTO ITEM (CUST_ID, ITEM_ID, ITEM_CATEGORY, ITEM_STATUS, COUNTS, PRICE)
+VALUES 
+('c-104', 'a-104', 'Oil', 'Active', 0, 500);   -- COUNTS = 0 will break the division!
+
+-- Email notification setup
+CREATE OR REPLACE NOTIFICATION INTEGRATION DT_FAILURE_ALERT
+TYPE = EMAIL
+ENABLED = TRUE
+ALLOWED_RECIPIENTS = ('emailid@gmail.com')
+COMMENT = 'Snowflake Dynamic Table Refresh Notification';
+
+-- Alert that watches for refresh failures
+CREATE OR REPLACE ALERT DT_FAILURE
+WAREHOUSE = COMPUTE_WH
+SCHEDULE = '1 MINUTE'
+IF (EXISTS (
+    SELECT * FROM TABLE(
+        INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY(
+            DATA_TIMESTAMP_START => DATEADD('hour', -1, CURRENT_TIMESTAMP()),
+            DATA_TIMESTAMP_END   => DATEADD('hour', 0, CURRENT_TIMESTAMP()),
+            NAME => 'CUST_ITEM_DT', 
+            ERROR_ONLY => TRUE
+        )
+    )
+    ORDER BY name, data_timestamp
+))
+THEN CALL SYSTEM$SEND_EMAIL(
+    'DT_FAILURE_ALERT', 'emailid', 'Dynamic Table failure Notification',
+    'Issue with some data, Main Error {Division by Zero}'
+);
+
+-- Check dynamic table refresh history manually
+SELECT * FROM TABLE(
+    INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY(
+        DATA_TIMESTAMP_START => DATEADD('hour', -1, CURRENT_TIMESTAMP()),
+        DATA_TIMESTAMP_END   => DATEADD('hour', 0, CURRENT_TIMESTAMP()),
+        NAME => 'CUST_ITEM_DT', 
+        ERROR_ONLY => TRUE
+    )
+);
+
+ALTER ALERT DT_FAILURE RESUME;   -- Alerts are suspended by default, just like Tasks
+```
+
+## Line-by-Line / Block-by-Block Explanation
+
+### 1. Staging Tables
+```sql
+CREATE OR REPLACE TABLE STG_Customer (...);
+CREATE OR REPLACE TABLE ITEM (...);
+```
+These represent the **raw layer** — the exact data as it would land from Snowpipe ingesting files from S3. Notice the sample data intentionally contains:
+- `C-101` inserted **twice** with different `CUST_CREATED` dates (simulating an updated record arriving twice).
+- Item `a-101` for `C-101` inserted **twice** at different prices (simulating a price change over time).
+
+### 2. `CUSTOMER_DT` — Deduplication Dynamic Table
+```sql
+CREATE OR REPLACE DYNAMIC TABLE CUSTOMER_DT
+  TARGET_LAG = DOWNSTREAM
+  WAREHOUSE = COMPUTE_WH
+  INITIALIZE = ON_CREATE
+AS
+  SELECT * FROM STG_CUSTOMER 
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY CUST_ID ORDER BY CUST_CREATED DESC) = 1;
+```
+A **Dynamic Table** is a special Snowflake table type that automatically re-runs its defining query and refreshes itself whenever the source data changes — you don't need a Task or a manual `MERGE` script.
+
+- `QUALIFY ROW_NUMBER() OVER (PARTITION BY CUST_ID ORDER BY CUST_CREATED DESC) = 1` — this is the deduplication logic. For each `CUST_ID`, it numbers rows by creation date descending (newest = 1), then `QUALIFY` keeps only the row numbered 1 — i.e., the latest record per customer. `QUALIFY` is a Snowflake-specific clause that lets you filter directly on a window function's result (avoiding a wrapping subquery).
+- `TARGET_LAG = DOWNSTREAM` — this means "don't refresh on your own fixed schedule; instead, refresh whenever a *downstream* dynamic table (one that depends on you) needs fresh data." It's a way of saying "I don't drive my own refresh timing — whoever consumes me does."
+- `WAREHOUSE = COMPUTE_WH` — which virtual warehouse performs the refresh computation.
+- `INITIALIZE = ON_CREATE` — as soon as the table is created, immediately populate it with the full result set (as opposed to `ON_SCHEDULE`, which would wait for the first scheduled refresh before populating).
+
+### 3. `ITEM_DT` — Keep Only the Highest-Priced Item
+```sql
+CREATE OR REPLACE DYNAMIC TABLE ITEM_DT
+  TARGET_LAG = DOWNSTREAM
+  WAREHOUSE = COMPUTE_WH
+AS
+  SELECT * FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY CUST_ID ORDER BY PRICE DESC) AS rn
+    FROM ITEM 
+  ) t
+  WHERE rn = 1;
+```
+Same deduplication idea, but this time using a classic subquery + `WHERE rn = 1` instead of `QUALIFY` (both approaches are equivalent — the video shows both styles). For each customer, only the item row with the **highest price** survives.
+
+### 4. `CUST_ITEM_DT` — The Final Combined Table
+```sql
+CREATE OR REPLACE DYNAMIC TABLE CUST_ITEM_DT
+  TARGET_LAG = '1 MINUTES'
+  WAREHOUSE = COMPUTE_WH
+AS
+  SELECT c.cust_id, c.cust_name, c.crid, c.location, c.cust_created,
+         a.item_id, a.item_category, a.item_status, a.price, a.counts,
+         ROUND(a.price / a.counts, 2) AS Price_Per_item
+  FROM CUSTOMER_DT c, ITEM_DT a
+  WHERE c.cust_id = a.cust_id;
+```
+This joins the two cleaned dynamic tables (`CUSTOMER_DT` and `ITEM_DT`) — the comma between tables plus a `WHERE` clause is old-style SQL for an inner join. It then calculates a derived metric: `price / counts`, rounded to 2 decimals.
+
+- `TARGET_LAG = '1 MINUTES'` — this table sits at the **top of the chain**, so it needs an actual, real refresh schedule rather than `DOWNSTREAM` (since nothing is downstream of it). Every 1 minute, Snowflake checks if source data changed and refreshes accordingly. Because `CUSTOMER_DT` and `ITEM_DT` were set to `DOWNSTREAM`, this 1-minute schedule on the *final* table effectively drives refreshes for the entire chain.
+
+**Key concept: Dynamic Table Dependency Graph.** Snowflake automatically tracks that `CUST_ITEM_DT` depends on `CUSTOMER_DT` and `ITEM_DT`. Whichever table has the "real" schedule (here, the 1-minute one) pulls the `DOWNSTREAM` tables along with it during refresh — you don't need to manually orchestrate the order.
+
+### 5. The Deliberate Failure — Division by Zero
+```sql
+INSERT INTO ITEM (CUST_ID, ITEM_ID, ITEM_CATEGORY, ITEM_STATUS, COUNTS, PRICE)
+VALUES ('c-104', 'a-104', 'Oil', 'Active', 0, 500);
+```
+This inserts a row where `COUNTS = 0`. Since `CUST_ITEM_DT`'s formula is `price / counts`, this creates a **division-by-zero error** the next time the dynamic table refreshes — demonstrating a realistic scenario where bad data silently breaks a pipeline unless you're actively monitoring for it.
+
+### 6. Notification Integration
+```sql
+CREATE OR REPLACE NOTIFICATION INTEGRATION DT_FAILURE_ALERT
+TYPE = EMAIL
+ENABLED = TRUE
+ALLOWED_RECIPIENTS = ('emailid@gmail.com')
+COMMENT = 'Snowflake Dynamic Table Refresh Notification';
+```
+This is a Snowflake object that authorizes sending emails to a specific, whitelisted set of recipients. You must create this before you can call `SYSTEM$SEND_EMAIL`.
+
+### 7. The Alert Object
+```sql
+CREATE OR REPLACE ALERT DT_FAILURE
+WAREHOUSE = COMPUTE_WH
+SCHEDULE = '1 MINUTE'
+IF (EXISTS (
+    SELECT * FROM TABLE(
+        INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY(
+            DATA_TIMESTAMP_START => DATEADD('hour', -1, CURRENT_TIMESTAMP()),
+            DATA_TIMESTAMP_END   => DATEADD('hour', 0, CURRENT_TIMESTAMP()),
+            NAME => 'CUST_ITEM_DT', 
+            ERROR_ONLY => TRUE
+        )
+    )
+))
+THEN CALL SYSTEM$SEND_EMAIL(...);
+```
+An **Alert** is a Snowflake object made of three parts: a schedule (how often to check), a condition (`IF EXISTS ...` — did anything match?), and an action (`THEN CALL ...` — what to do if the condition is true).
+
+- `INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY(...)` is a **table function** that returns the refresh history of a dynamic table — including any refreshes that failed.
+- `ERROR_ONLY => TRUE` filters this history down to only the failed refresh attempts.
+- `DATA_TIMESTAMP_START` / `DATA_TIMESTAMP_END` define the lookback window (here, the last 1 hour).
+- If this query returns **any rows at all** (`EXISTS`), it means there was at least one failed refresh recently — trigger the `THEN` action.
+- `SYSTEM$SEND_EMAIL('DT_FAILURE_ALERT', 'emailid', 'subject', 'body')` is a built-in Snowflake function that sends an email using the notification integration you created, to the given recipient, with a subject and body.
+
+### 8. Resuming the Alert
+```sql
+ALTER ALERT DT_FAILURE RESUME;
+```
+Just like **Tasks**, newly created **Alerts** are **suspended by default**. You must explicitly resume them, or they will never actually run — a very common "gotcha" that catches people off guard (the presenter even calls this out directly: "don't forget to resume it").
+
+## What the Video Demonstrated
+
+1. Created the staging tables and the chain of 3 dynamic tables.
+2. Confirmed `CUSTOMER_DT` correctly kept only the latest record per customer, and `ITEM_DT` kept only the highest-priced item.
+3. Inserted a bad row with `COUNTS = 0`.
+4. Watched `CUST_ITEM_DT`'s refresh fail with error code `1051` (division by zero) after its 1-minute schedule triggered.
+5. Set up the notification integration + alert, resumed the alert, and received an actual email within about a minute of the failure.
+6. Fixed the bad row (`UPDATE ITEM SET COUNTS = 5 WHERE ...`) to stop future failures.
+
+## Interview Takeaways
+
+| Concept | Why It Matters |
+|---|---|
+| Dynamic Tables | Declarative way to build multi-stage transformation pipelines without writing/scheduling your own MERGE logic |
+| `TARGET_LAG = DOWNSTREAM` | Lets intermediate tables inherit their refresh timing from whichever table consumes them, avoiding redundant schedules |
+| `QUALIFY` | Snowflake-specific clause to filter directly on window function results |
+| Dynamic Table dependency graph | Snowflake automatically manages refresh order across dependent dynamic tables |
+| `INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY()` | Table function to audit dynamic table refresh success/failure history |
+| Alerts vs. Tasks | Alerts are built for "check condition → notify," commonly paired with `SYSTEM$SEND_EMAIL`; both are suspended by default and must be resumed |
+| Notification Integration | Required setup object before you can send emails from Snowflake |
+
+---
+
+# Scenario 3: Load Excel Files into Snowflake Using Snowpark (Python)
+
+## The Business Problem
+
+Snowflake's native `COPY INTO` command works great for CSV/JSON/Parquet — but it **cannot directly load Excel (.xlsx) files**. If a business team keeps sending Excel files instead of CSVs, you need another way in. The answer: use **Snowpark Python** together with the `pandas` and `openpyxl` libraries to read the Excel file and push it into a Snowflake table — all inside a stored procedure so it can be called and scheduled like any other Snowflake object.
+
+## The Design (Plain English)
+
+```
+Excel file sitting in an internal stage (@EXCEL_DATA)
+        │
+        ▼
+Snowpark Python Procedure:
+   1. Download file from stage to local temp storage
+   2. Read it into a pandas DataFrame (pandas understands .xlsx)
+   3. Convert pandas DataFrame → Snowpark DataFrame
+   4. Write Snowpark DataFrame into a real Snowflake table
+   5. Log the outcome (success/failure + row count) to a log table
+```
+
+## Full Code
+
+```sql
+CREATE OR REPLACE PROCEDURE LOAD_EXCEL_FILES(file_name STRING, target_table STRING) 
+RETURNS STRING
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.9'
+PACKAGES = ('snowflake-snowpark-python', 'pandas', 'openpyxl')
+HANDLER = 'main'   
+AS
+$$
+import pandas as pd
+from snowflake.snowpark import Session
+import traceback 
+
+def main(session: Session, file_name: str, target_table: str) -> str:
+    try:
+        # Step 2: Get file from stage
+        file_path = f"@EXCEL_DATA/{file_name}"  
+        session.file.get(file_path, '/tmp')  # download file from stage to local temp folder
+        local_path = f"/tmp/{file_name}" 
+
+        # Step 3: Read Excel into pandas dataframe
+        panda_df = pd.read_excel(local_path)
+
+        # Step 4: Convert pandas dataframe to Snowpark dataframe
+        snow_df = session.create_dataframe(panda_df)
+
+        try:
+            # Step 5: Write dataframe to Snowflake table
+            snow_df.write.save_as_table(target_table, mode="overwrite")
+
+            # Step 6: Log success with row count
+            row_count = len(panda_df)
+            log_status(session, file_name, target_table, "SUCCESS", None, row_count)
+            return f"{row_count} rows into table '{target_table}' Loaded Successfully"
+
+        except Exception as e:
+            # Step 7: Log failure if table write fails
+            log_status(session, file_name, target_table, "FAILED", str(e), 0)
+            return f"Failed to write table: {e}"
+
+    except Exception as e:
+        # Step 8: Log top-level failure
+        log_status(session, file_name, target_table, "FAILED", traceback.format_exc()[:1500], 0)
+        return f"Procedure could not execute. Error: {str(e)}"
+
+
+def log_status(session, file_name, target_table, status, error_message=None, row_count=0):
+    try:
+        insert_stmt = f"""
+            INSERT INTO EXCEL_LOAD_LOGS (
+                FILE_NAME, TARGET_TABLE, STATUS, ERROR_MESSAGE, ROW_COUNT, ETL_LOAD_TIME
+            )
+            VALUES (
+                '{file_name}',
+                '{target_table}',
+                '{status}',
+                {'NULL' if error_message is None else "'" + error_message.replace("'", "''") + "'"},
+                {row_count},
+                CURRENT_TIMESTAMP()
+            )
+        """
+        session.sql(insert_stmt).collect()
+    except Exception as log_err:
+        print("Log insert failed:", log_err)
+$$;
+```
+
+## Line-by-Line / Block-by-Block Explanation
+
+### 1. Procedure Header
+```sql
+CREATE OR REPLACE PROCEDURE LOAD_EXCEL_FILES(file_name STRING, target_table STRING) 
+RETURNS STRING
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.9'
+PACKAGES = ('snowflake-snowpark-python', 'pandas', 'openpyxl')
+HANDLER = 'main'
+```
+- This is a **Python stored procedure** — unlike Scenario 1, it's written in Python instead of SQL, which is necessary because Excel parsing needs the `pandas` + `openpyxl` libraries.
+- It takes two parameters: `file_name` (which Excel file to load) and `target_table` (where to load it) — this makes it reusable for any file/table combination, not hardcoded to one.
+- `PACKAGES = (...)` tells Snowflake which pre-approved Anaconda-hosted Python packages to make available inside the sandboxed execution environment.
+- `HANDLER = 'main'` tells Snowflake which Python function to actually call when the procedure runs — Snowflake will look for a function named `main` in the code below.
+
+### 2. Function Signature
+```python
+def main(session: Session, file_name: str, target_table: str) -> str:
+```
+Every Snowpark Python procedure's handler function automatically receives a `session` object as its first argument — this is your live connection to Snowflake, used to run SQL, read/write tables, and access stage files, all without needing separate connection credentials.
+
+### 3. Download the File From Stage
+```python
+file_path = f"@EXCEL_DATA/{file_name}"  
+session.file.get(file_path, '/tmp')
+local_path = f"/tmp/{file_name}"
+```
+Snowpark's Python sandbox runs in an isolated environment that has its own local filesystem (`/tmp`). Since `pandas.read_excel()` needs an actual local file (it can't read directly from a Snowflake stage), you must first **download** the file from the stage into this local temp folder using `session.file.get(...)`.
+
+### 4. Read Excel Into pandas
+```python
+panda_df = pd.read_excel(local_path)
+```
+This is standard `pandas` — it reads the Excel file into a DataFrame, automatically inferring the column headers and data types. This is the whole reason Snowpark/Python is needed here: `pandas.read_excel()` has no native SQL equivalent in Snowflake.
+
+### 5. Convert pandas → Snowpark DataFrame
+```python
+snow_df = session.create_dataframe(panda_df)
+```
+A `pandas` DataFrame lives entirely in local Python memory. To actually get this data *into* Snowflake, you convert it into a **Snowpark DataFrame**, which is a lazy, distributed representation Snowflake understands and can push down into SQL operations.
+
+### 6. Write to a Real Snowflake Table
+```python
+snow_df.write.save_as_table(target_table, mode="overwrite")
+```
+This physically writes the Snowpark DataFrame into a Snowflake table named by the `target_table` parameter. `mode="overwrite"` means: if the table already exists, replace its contents entirely (other options include `"append"` to add rows without deleting existing ones).
+
+### 7. Nested Try/Except for Precise Error Isolation
+```python
+try:
+    # ... download + read + convert ...
+    try:
+        # write to table
+        ...
+    except Exception as e:
+        # only the WRITE failed
+        log_status(session, file_name, target_table, "FAILED", str(e), 0)
+        return f"Failed to write table: {e}"
+except Exception as e:
+    # something earlier failed (download or read)
+    log_status(session, file_name, target_table, "FAILED", traceback.format_exc()[:1500], 0)
+    return f"Procedure could not execute. Error: {str(e)}"
+```
+This mirrors the nested-`BEGIN...EXCEPTION` pattern from Scenario 1, but in Python: an **outer** try/except catches anything going wrong in the download/read/convert steps, while an **inner** try/except specifically isolates failures during the *table write* step. This precision is useful: it lets you distinguish "the Excel file itself is broken" from "the table write failed" (e.g., due to a schema mismatch or permissions issue) — two very different problems requiring different fixes.
+- `traceback.format_exc()[:1500]` captures the **full Python stack trace** (not just the error message) so you have maximum debugging detail, but truncated to 1500 characters so it doesn't overflow the log table's column size.
+
+### 8. The Logging Helper Function
+```python
+def log_status(session, file_name, target_table, status, error_message=None, row_count=0):
+    try:
+        insert_stmt = f"""
+            INSERT INTO EXCEL_LOAD_LOGS (...)
+            VALUES (
+                '{file_name}', '{target_table}', '{status}',
+                {'NULL' if error_message is None else "'" + error_message.replace("'", "''") + "'"},
+                {row_count}, CURRENT_TIMESTAMP()
+            )
+        """
+        session.sql(insert_stmt).collect()
+    except Exception as log_err:
+        print("Log insert failed:", log_err)
+```
+This is a reusable helper (called from three different places above) that writes to the `EXCEL_LOAD_LOGS` audit table.
+
+- `{'NULL' if error_message is None else "'" + error_message.replace("'", "''") + "'"}` — this is a common but important SQL-injection-safety pattern: if there's no error, insert the literal SQL keyword `NULL`; otherwise, wrap the error message in quotes, but first **escape any single quotes** inside it (`replace("'", "''")`) so an error message containing an apostrophe doesn't break the SQL statement or allow injection.
+- `session.sql(insert_stmt).collect()` — builds the SQL string and executes it. `.collect()` actually triggers execution (Snowpark queries are otherwise lazy).
+- The **whole logging call is itself wrapped in try/except** — a subtle but smart detail: if the *logging* step itself fails for some reason, it shouldn't crash the entire procedure; it just prints a message instead.
+
+## Interview Takeaways
+
+| Concept | Why It Matters |
+|---|---|
+| Python Stored Procedures | Needed whenever native SQL/COPY INTO can't handle a file format (like Excel) |
+| `PACKAGES` clause | Declares which sandboxed Python libraries the procedure can use |
+| `session.file.get()` | Downloads a stage file into the local Python sandbox filesystem |
+| pandas → Snowpark DataFrame conversion | The bridge between "regular Python data" and "Snowflake-native data" |
+| `save_as_table(mode="overwrite")` | Writes a DataFrame into a real table; overwrite vs. append matters |
+| Nested try/except | Isolates *which stage* of the pipeline failed for more precise debugging |
+| Escaping quotes before dynamic SQL insert | Prevents broken SQL / injection issues when logging arbitrary error text |
+
+---
+
+# Scenario 4: Automate Table Creation & Data Load from S3 to Snowflake Using Snowpark
+
+## The Business Problem
+
+Multiple teams (finance, marketing, sales, HR) drop CSV files into a shared S3 bucket, each team in its own folder. Requirements:
+1. Automatically detect new folders/files.
+2. If a folder is new, automatically **create a matching table** (without you manually writing `CREATE TABLE` for every possible team).
+3. Load only **new** files — never reload a file that was already processed.
+4. Run this on a **schedule** (via a Task) so it's fully hands-off.
+5. If anything breaks, get an **email notification** automatically.
+
+This is essentially a self-service, self-expanding ingestion framework — a very common "warehouse automation" interview scenario.
+
+## The Design (Plain English)
+
+```
+S3 Bucket
+ ├── customer/customer.csv
+ ├── nation/nation.csv
+ ├── region/region.csv
+ └── supplier/supplier.csv
+        │
+        ▼
+Snowpark Python Procedure (runs on a schedule via TASK):
+   1. LIST all files in the external stage
+   2. Compare against LOG_TABLE — skip files already processed
+   3. For new files: extract folder name (→ becomes table name) and file name
+   4. If table doesn't exist yet → CREATE TABLE automatically using INFER_SCHEMA
+   5. COPY INTO the table
+   6. INSERT a row into LOG_TABLE marking this file as processed
+        │
+        ▼
+   If the procedure/task fails → SNS/email notification fires automatically
+```
+
+## Full Code
+
+```python
+import snowflake.snowpark as snowpark
+from snowflake.snowpark.functions import col
+
+def main(session: snowpark.Session) -> str:
+    stage = "@S3_STAGE"
+    file_format = "csv_format"
+    created_tables = []
+    log_messages = []  # To store all messages for final output
+
+    # List all files from the stage
+    stage_files_df = session.sql(f"LIST {stage}").collect()
+
+    # check already loaded files from Audit table
+    loaded_files_df = session.table("LOG_TABLE").select("FILE_NAME").collect()
+    already_loaded_files = {row["FILE_NAME"] for row in loaded_files_df}
+
+    for row in stage_files_df:
+        file_path = row['name']  # e.g., s3://bucket/folder/file.csv
+
+        # if files are already loaded then we skip those files here
+        if file_path in already_loaded_files:
+            msg = f"Skipping already loaded file: {file_path}"
+            print(msg)
+            log_messages.append(msg)
+            continue
+
+        # get the complete file path and split based on /
+        parts = file_path.split('/')
+
+        # extracting folder, file name and setting folder = table name
+        if len(parts) > 1:
+            folder = parts[-2]
+            file_name = parts[-1]
+            table_name = folder.upper()
+
+            # setting up complete path for the copy into load
+            full_path = f"{stage}/{folder}/{file_name}"
+
+            # Check if table already exists
+            exists_result = session.sql(f"""
+                SELECT COUNT(*) AS count 
+                FROM INFORMATION_SCHEMA.TABLES 
+                WHERE TABLE_NAME = '{table_name}' 
+                AND TABLE_SCHEMA = CURRENT_SCHEMA()
+            """).collect()
+            
+            exists = int(exists_result[0]['COUNT']) if exists_result else 0
+
+            if exists == 0:
+                # Create table automatically using INFER_SCHEMA
+                create_table_sql = f"""
+                    CREATE OR REPLACE TABLE {table_name}
+                    USING TEMPLATE (
+                        SELECT ARRAY_AGG(OBJECT_CONSTRUCT(*))
+                        FROM TABLE(
+                            INFER_SCHEMA(LOCATION => '{stage}/{folder}/', FILE_FORMAT => '{file_format}')
+                        )
+                    )
+                """
+                session.sql(create_table_sql).collect()
+                created_tables.append(table_name)
+                log_messages.append(f"Created new table: {table_name}")
+
+            # load data into table using COPY INTO
+            copy_sql = f"""
+                COPY INTO {table_name}
+                FROM {full_path}
+                FILE_FORMAT = (FORMAT_NAME = '{file_format}')
+                MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+                ON_ERROR = ABORT_STATEMENT
+            """
+            session.sql(copy_sql).collect()
+            log_messages.append(f"Loaded data into table: {table_name} from {file_name}")
+
+            # log the processed file so we skip it next time
+            session.sql(f"""
+                INSERT INTO LOG_TABLE (FOLDER_NAME, FILE_NAME)
+                VALUES ('{folder}', '{file_path}')
+            """).collect()
+            log_messages.append(f"Logged file: {file_path}")
+
+    if not log_messages:
+        log_messages.append("No new files processed. All files were already loaded.")
+
+    message = "\n".join(log_messages)
+    print("Final Result:\n", message)
+
+    return session.create_dataframe([[message]], schema=["RESULT"])
+```
+
+**Supporting setup shown in the video (SQL side):**
+```sql
+CREATE OR REPLACE SCHEMA AUTO;
+
+CREATE OR REPLACE TABLE LOG_TABLE (
+    FOLDER_NAME STRING,
+    FILE_NAME STRING,
+    LOAD_TIMESTAMP TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+);
+
+CREATE OR REPLACE FILE FORMAT csv_format
+  TYPE = 'CSV'
+  PARSE_HEADER = TRUE;   -- required for INFER_SCHEMA (cannot use SKIP_HEADER)
+
+CREATE OR REPLACE STORAGE INTEGRATION s3_int
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = S3
+  ENABLED = TRUE
+  STORAGE_AWS_ROLE_ARN = '<role-arn-from-aws>'
+  STORAGE_ALLOWED_LOCATIONS = ('s3://realtime-project-snowflake/');
+
+CREATE OR REPLACE STAGE S3_STAGE
+  URL = 's3://realtime-project-snowflake/'
+  STORAGE_INTEGRATION = s3_int;
+
+CREATE OR REPLACE NOTIFICATION INTEGRATION task_error_notification
+  TYPE = QUEUE
+  NOTIFICATION_PROVIDER = AWS_SNS
+  ENABLED = TRUE
+  AWS_SNS_TOPIC_ARN = '<sns-topic-arn>'
+  AWS_SNS_ROLE_ARN = '<same-role-arn>';
+
+CREATE OR REPLACE TASK autoload_tables
+  WAREHOUSE = COMPUTE_WH
+  SCHEDULE = '1 MINUTE'
+  ERROR_INTEGRATION = task_error_notification
+AS
+  CALL SP_AUTO_S3_TABLES();
+
+ALTER TASK autoload_tables RESUME;  -- Tasks are suspended by default
+```
+
+## Line-by-Line / Block-by-Block Explanation
+
+### 1. Setup — Listing Stage Files
+```python
+stage_files_df = session.sql(f"LIST {stage}").collect()
+```
+`LIST @S3_STAGE` is a Snowflake command that returns every file currently sitting in the stage, including its full path (e.g., `s3://bucket/customer/customer.csv`), size, and last-modified time. This is how the procedure "discovers" what exists in S3 without you telling it in advance.
+
+### 2. Building the "Already Loaded" Lookup Set
+```python
+loaded_files_df = session.table("LOG_TABLE").select("FILE_NAME").collect()
+already_loaded_files = {row["FILE_NAME"] for row in loaded_files_df}
+```
+- `session.table("LOG_TABLE")` reads the audit table as a Snowpark DataFrame.
+- `{row["FILE_NAME"] for row in loaded_files_df}` is a Python **set comprehension** — it builds a Python `set` of every filename already logged. Sets give **O(1) fast lookups**, which matters if you have thousands of files to check against.
+
+### 3. The Main Loop — Skip Already-Processed Files
+```python
+for row in stage_files_df:
+    file_path = row['name']
+    if file_path in already_loaded_files:
+        msg = f"Skipping already loaded file: {file_path}"
+        log_messages.append(msg)
+        continue
+```
+For every file found in the stage, check if it's already in the "processed" set. If yes, `continue` immediately jumps to the next file — this is the **idempotency** mechanism that prevents duplicate loads if the procedure runs repeatedly (e.g., every minute via a Task) and finds the same old files still sitting there.
+
+### 4. Extracting Folder Name → Table Name
+```python
+parts = file_path.split('/')
+if len(parts) > 1:
+    folder = parts[-2]
+    file_name = parts[-1]
+    table_name = folder.upper()
+```
+Given a path like `s3://bucket/customer/customer.csv`, splitting on `/` gives a list of parts. `parts[-1]` is the last element (`customer.csv` — the file name), and `parts[-2]` is the second-to-last (`customer` — the folder name). The folder name becomes the table name (uppercased, since Snowflake unquoted identifiers are case-insensitive and stored as uppercase by convention).
+
+**This is the clever trick of the whole scenario:** the S3 folder structure itself dictates the Snowflake table structure — no manual mapping needed. Drop a new folder called `sales/`, and the next run will create a `SALES` table automatically.
+
+### 5. Checking If the Table Already Exists
+```python
+exists_result = session.sql(f"""
+    SELECT COUNT(*) AS count 
+    FROM INFORMATION_SCHEMA.TABLES 
+    WHERE TABLE_NAME = '{table_name}' 
+    AND TABLE_SCHEMA = CURRENT_SCHEMA()
+""").collect()
+
+exists = int(exists_result[0]['COUNT']) if exists_result else 0
+```
+`INFORMATION_SCHEMA.TABLES` is Snowflake's built-in metadata catalog — querying it for a matching `TABLE_NAME` tells you whether that table already exists in the current schema. If the count is `0`, the table doesn't exist yet and needs to be created.
+
+### 6. Auto-Creating the Table with `INFER_SCHEMA`
+```python
+create_table_sql = f"""
+    CREATE OR REPLACE TABLE {table_name}
+    USING TEMPLATE (
+        SELECT ARRAY_AGG(OBJECT_CONSTRUCT(*))
+        FROM TABLE(
+            INFER_SCHEMA(LOCATION => '{stage}/{folder}/', FILE_FORMAT => '{file_format}')
+        )
+    )
+"""
+session.sql(create_table_sql).collect()
+```
+This is the standout Snowflake feature in this scenario: `INFER_SCHEMA` is a table function that **reads the actual file(s) in a stage location** and detects the column names and data types automatically — no need to know in advance what columns any given team's CSV will have.
+- `INFER_SCHEMA(LOCATION => '...', FILE_FORMAT => '...')` scans the file and returns one row per detected column (name, type, nullable, etc.).
+- `OBJECT_CONSTRUCT(*)` turns each detected column's metadata into a JSON object.
+- `ARRAY_AGG(...)` collects all those column-definition objects into a single array.
+- `CREATE TABLE ... USING TEMPLATE (...)` is special CREATE TABLE syntax that accepts this array of inferred column definitions and builds the table structure from it directly — effectively "create a table that matches whatever columns this file has."
+
+This is why the file format was created with `PARSE_HEADER = TRUE` instead of `SKIP_HEADER = 1` — `INFER_SCHEMA` specifically needs `PARSE_HEADER` to correctly read column names from the CSV header row.
+
+### 7. Loading the Data
+```python
+copy_sql = f"""
+    COPY INTO {table_name}
+    FROM {full_path}
+    FILE_FORMAT = (FORMAT_NAME = '{file_format}')
+    MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+    ON_ERROR = ABORT_STATEMENT
+"""
+session.sql(copy_sql).collect()
+```
+Standard `COPY INTO`, but note `MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE` — this tells Snowflake to match CSV columns to table columns **by name** (ignoring case) rather than strictly by position. This pairs naturally with the auto-inferred schema, since column order in the file and table should already line up, but this adds a layer of safety.
+
+### 8. Logging the Processed File
+```python
+session.sql(f"""
+    INSERT INTO LOG_TABLE (FOLDER_NAME, FILE_NAME)
+    VALUES ('{folder}', '{file_path}')
+""").collect()
+```
+After a successful load, the file's full path is recorded in `LOG_TABLE`. This is exactly what feeds the `already_loaded_files` set the *next* time the procedure runs — completing the idempotency loop.
+
+### 9. Returning a Result as a DataFrame
+```python
+message = "\n".join(log_messages)
+return session.create_dataframe([[message]], schema=["RESULT"])
+```
+Unlike Scenario 3 (which returned a plain string), this handler returns a **Snowpark DataFrame** — a valid alternative return type for a Python procedure, useful when you want the output to look like a query result set (one row, one `RESULT` column) rather than a raw string.
+
+### 10. The Orchestration Layer — Task + Error Notification
+```sql
+CREATE OR REPLACE TASK autoload_tables
+  WAREHOUSE = COMPUTE_WH
+  SCHEDULE = '1 MINUTE'
+  ERROR_INTEGRATION = task_error_notification
+AS
+  CALL SP_AUTO_S3_TABLES();
+
+ALTER TASK autoload_tables RESUME;
+```
+This is what makes the whole thing "automated" rather than something you run manually:
+- `SCHEDULE = '1 MINUTE'` — Snowflake automatically calls the procedure every minute.
+- `ERROR_INTEGRATION = task_error_notification` — if the task's procedure call throws an unhandled error, Snowflake automatically publishes a failure message to the configured **AWS SNS topic**, which (once subscribed) emails the team.
+- `ALTER TASK ... RESUME` — same rule as before: **Tasks are suspended by default** and must be explicitly resumed, or the schedule will simply never fire.
+
+### 11. AWS-Side Setup (Storage Integration + SNS)
+Two AWS integrations were configured in the video, both following the same underlying pattern — a **secure handshake** between AWS and Snowflake:
+1. **Storage Integration**: lets Snowflake read S3 files without needing to hardcode AWS access keys/secret keys — instead, Snowflake assumes an IAM role that trusts a specific external ID, and that IAM role has S3 read permissions.
+2. **Notification Integration (type QUEUE, provider AWS_SNS)**: lets a Snowflake Task automatically publish failure messages to an SNS topic, which is subscribed to an email address — so any task failure results in an automatic email, without needing an Alert object like Scenario 2 used.
+
+Both integrations require: create/identify an IAM role in AWS → get its ARN and an external ID from Snowflake's `DESCRIBE INTEGRATION` output → paste those into the AWS IAM role's **trust policy** — completing the two-way trust relationship.
+
+## What the Video Demonstrated
+
+1. Ran the task for the first time — it processed all 5 existing folders/files, auto-creating 5 matching tables and logging each into `LOG_TABLE`.
+2. Added a brand-new folder (`line_item/`) with a new file — the *very next scheduled run* automatically detected it, created a `LINE_ITEM` table, and loaded the data — with zero code changes required.
+3. Deliberately broke the stage reference (typo'd the stage name) to simulate a failure — the task failed, and an SNS-driven email notification arrived automatically with the actual error message.
+
+## Interview Takeaways
+
+| Concept | Why It Matters |
+|---|---|
+| `LIST @stage` | Programmatically discover what files exist in a stage |
+| Set-based lookup for "already processed" | Efficient idempotency check to avoid reloading the same file twice |
+| Folder name → table name convention | A powerful pattern for fully automated, self-expanding ingestion frameworks |
+| `INFORMATION_SCHEMA.TABLES` existence check | Standard way to conditionally create objects only if they don't already exist |
+| `INFER_SCHEMA` + `CREATE TABLE ... USING TEMPLATE` | Lets Snowflake auto-detect and build a table schema directly from a file, with zero manual DDL |
+| `MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE` | Loads data by column name instead of position — safer when schemas are inferred dynamically |
+| Snowpark Python for orchestration logic | Python is better suited than pure SQL for looping, string parsing, and conditional branching logic like this |
+| Task `ERROR_INTEGRATION` vs. Alert-based monitoring | Two different but equally valid ways to get automatic failure notifications — Tasks have a built-in error-integration hook; Dynamic Tables/other objects can be monitored via a separate Alert object (see Scenario 2) |
+| Storage Integration & Notification Integration (SNS) | The standard two-way trust pattern for connecting Snowflake securely to AWS resources, without hardcoding credentials |
+| Tasks are suspended by default | A near-universal Snowflake "gotcha" — always remember `ALTER TASK ... RESUME` (same applies to Alerts and Pipes have the opposite default — Snowpipes start running automatically) |
+
+---
+
+# Cross-Scenario Summary — Patterns That Repeat
+
+These four scenarios, while different in purpose, share several recurring Snowflake design patterns worth remembering for interviews:
+
+1. **Validate-before-commit staging pattern** (Scenario 1): load into a temp/staging object first, check data quality, only then move into the "real" table.
+2. **Always log the outcome, success or failure** (all 4 scenarios): audit tables are a non-negotiable part of production pipelines — you should never have to guess why yesterday's load didn't work.
+3. **Nested error handling** (Scenarios 1 & 3): isolate *which specific step* failed (load vs. validation vs. write) so error messages are actionable, not generic.
+4. **Suspended-by-default objects**: Tasks and Alerts both start suspended and must be explicitly resumed — Snowpipes, by contrast, start running immediately. Always double-check object state after creation.
+5. **Automated failure notification** via either:
+   - **Alerts** + `SYSTEM$SEND_EMAIL` + a Notification Integration (`TYPE = EMAIL`) — good for monitoring conditions on data/objects like Dynamic Tables.
+   - **Task `ERROR_INTEGRATION`** + AWS SNS + a Notification Integration (`TYPE = QUEUE`) — good for monitoring scheduled task execution failures.
+6. **Dynamic/parameterized object names** using `IDENTIFIER(:variable)` (SQL) or f-strings (Python) — makes procedures reusable instead of hardcoded to one table.
+7. **Schema-on-read automation** via `INFER_SCHEMA` — removes the need to manually define table DDL when source files are unpredictable or numerous.
+8. **Snowpark Python bridges the gap** wherever pure SQL can't do the job — reading non-native file formats (Excel), complex looping/branching logic, or dynamic multi-table orchestration.
