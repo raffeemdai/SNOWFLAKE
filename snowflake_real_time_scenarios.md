@@ -1,3 +1,9 @@
+
+snowflake iceberg tables
+
+https://medium.com/snowflake/snowflake-managed-vs-self-managed-iceberg-tables-what-actually-determines-the-difference-c5615ba0d280
+
+
 # Snowflake Real-Time Scenarios – Simple Explanations with Full Code Walkthrough
 
 This guide covers **5 real-world Snowflake scenarios** that are commonly asked in interviews and faced in actual data engineering projects. Each scenario explains **the problem, the idea behind the solution, and a line-by-line explanation of the code** in simple language.
