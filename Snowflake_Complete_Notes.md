@@ -119,7 +119,7 @@ Snowflake is a single platform supporting many workloads: data warehousing, data
 
 Understanding architecture matters because it lets you diagnose performance problems, understand billing, and use features effectively.
 
-Snowflake is a **hybrid** of **shared-disk** and **shared-nothing** architecture:
+Snowflake describes its own design as a **"multi-cluster, shared data" architecture** that is elastic by nature — a **hybrid** of **shared-disk** and **shared-nothing** architecture:
 - **Shared-disk** aspect: a single, central data repository that *all* compute nodes can access.
 - **Shared-nothing** aspect: queries are processed using **MPP (Massively Parallel Processing)** — each compute node works on its own local slice of data — giving the performance and scalability benefits of shared-nothing systems while keeping data management simple.
 
@@ -218,6 +218,10 @@ Credit consumption is a direct function of **warehouse size** (T-shirt sizing) a
 
 So on Enterprise Edition (US, $3/credit), an Extra Small warehouse running for one hour costs **$3/hour**; a Small costs **$6/hour**; and so on — multiply credits by the per-credit dollar rate.
 
+#### Regional Price Variance — A Concrete Example
+
+Both compute and storage pricing genuinely shift by cloud provider and region — this isn't just a rounding difference. For example, on Enterprise Edition, AWS US East pricing (~$3/credit) can rise to **~$3.90/credit on AWS EU regions**, and storage that costs **~$23/TB/month on AWS US East** can rise to **~$24.50/TB/month on AWS EU (Frankfurt)**. Always check the official Snowflake pricing page for your specific cloud + region combination before estimating a project's cost.
+
 #### Billing Granularity
 
 - Snowflake bills **per second**, **but** enforces a **minimum billing of 60 seconds** per warehouse activation. A query that finishes in 42 seconds is still billed for a full 60 seconds; a query running for 450 seconds is billed for exactly 450 seconds.
@@ -247,13 +251,23 @@ Key sections you'll use:
 
 ### 4.2 Worksheets — Where You'll Spend Most of Your Time
 
-Before running any query, you set the **context**: Database, Schema, Role, and Warehouse. Once set, you can run standard SQL.
+Before running any query, you set the **context**: Database, Schema, Role, and Warehouse. Once set, you can run standard SQL — for example, creating your very first database and schema straight from a worksheet:
+
+```sql
+-- Creating a database automatically creates PUBLIC + INFORMATION_SCHEMA underneath it
+CREATE DATABASE youtube_training;
+
+-- Creating an additional, custom schema inside that database
+CREATE SCHEMA raw_data;
+```
+
+Run a highlighted statement with `Ctrl+Enter` (or the blue "run" icon) — the query pane below will show the result set, and a Query ID/status pane will confirm success or failure.
 
 Key worksheet features:
 - **Query Profiling** — every executed query shows a Query ID, execution time breakdown (compilation, provisioning, execution), rows scanned, and whether caching was used.
 - **Run / Run All** — run a single highlighted statement (`Ctrl+Enter`) or all statements in the worksheet (`Ctrl+Shift+Enter`).
 - **Result Pane Controls** — hide/show results, select specific columns to display, download results as CSV/TSV.
-- **Query History (clock icon)** — every query run in that worksheet, filterable by status (queued, running, failed, successful).
+- **Query History (clock icon)** — every query run in that worksheet, filterable by status (queued, running, failed, successful). Beyond the obvious columns (warehouse, user, status, query ID, duration, start time), you can also surface extra columns like **Session ID, Client Driver, Rows, Query Tag,** and **Incident** for deeper diagnostics.
 - **Code Versions** — every time you *run* a statement, a new "version" of the worksheet's code is saved (identical reruns don't create duplicate versions). This lets you recover code you accidentally overwrote or deleted — a built-in undo/version-history mechanism.
 - **Format Query** — auto-formats messy SQL into clean, readable SQL.
 - **Sharing** — worksheets can be shared with teammates with granular permission (e.g., "View and Run" vs. "View Results only" vs. cannot view), depending on the invitee's assigned role.
@@ -310,6 +324,22 @@ A **Virtual Warehouse** is Snowflake's **compute engine** — not a data storage
 ### 5.5 Cost vs. Performance Trade-off
 
 Sometimes a **bigger** warehouse is actually **cheaper overall** for a heavy query: if a Large warehouse finishes a job **4× faster** than a Small warehouse, the total credit consumption can end up roughly the same — but you save significant wall-clock time. Choosing the right size for your workload is one of the most important skills for anyone managing Snowflake cost and performance (especially relevant for people with 8+ years of experience who may take on warehouse-sizing responsibilities).
+
+### 5.6 Creating a Warehouse via SQL
+
+While warehouses are most often created through the Snowsight "+ Warehouse" wizard, the same thing can be done with plain SQL — useful for scripting and CI/CD:
+
+```sql
+CREATE OR REPLACE WAREHOUSE my_wh
+  WAREHOUSE_SIZE = 'XSMALL'
+  AUTO_SUSPEND = 300         -- seconds of inactivity (5 minutes) before suspending
+  AUTO_RESUME = TRUE         -- automatically wake up on the next incoming query
+  MIN_CLUSTER_COUNT = 1      -- multi-cluster: minimum clusters to keep running
+  MAX_CLUSTER_COUNT = 3      -- multi-cluster: maximum clusters allowed to spin up
+  SCALING_POLICY = 'STANDARD'; -- or 'ECONOMY'
+```
+
+`MIN_CLUSTER_COUNT` / `MAX_CLUSTER_COUNT` greater than 1 is what actually turns this into a **Multi-cluster Warehouse** capable of horizontal scaling (Section 5.2); leaving both at `1` keeps it a single-cluster warehouse that can only scale vertically by resizing.
 
 ---
 
@@ -438,6 +468,24 @@ You **can** create a Temporary table with the **same name** as an existing Perma
 
 Fail-Safe (7 days, non-configurable, Permanent-tables-only) is **not free**. If you're changing 1GB of data daily in a Permanent table, multiple historical versions accumulate in Fail-Safe, exponentially increasing your storage bill. For high-churn staging tables, use **Transient** tables instead to eliminate this cost entirely.
 
+### 9.4 Creating Each Table Type — Syntax
+
+```sql
+-- Permanent (default — no keyword needed)
+CREATE TABLE dim_customer (customer_id INT, name VARCHAR);
+
+-- Transient — ideal for staging/landing tables
+CREATE TRANSIENT TABLE staging_orders (order_id INT, raw_payload VARIANT);
+
+-- Temporary — exists only for the current session
+CREATE TEMPORARY TABLE session_calc (calc_id INT, result FLOAT);
+
+-- External — a read-only pointer to files already sitting in a stage
+CREATE EXTERNAL TABLE ext_orders
+  LOCATION = @my_stage
+  FILE_FORMAT = (TYPE = CSV);
+```
+
 ---
 
 ## 10. Stages
@@ -543,6 +591,14 @@ VALIDATION_MODE = RETURN_ALL_ERRORS;
 | `CONTINUE` | Loads all clean rows, skips corrupted ones |
 | `SKIP_FILE` | Skips the *entire file* if even one row errors |
 
+```sql
+-- Load everything that parses correctly; silently skip bad rows
+COPY INTO dim_customer FROM @STG_CSV ON_ERROR = CONTINUE;
+
+-- Discard the whole file the moment a single row fails to parse
+COPY INTO dim_customer FROM @STG_CSV ON_ERROR = SKIP_FILE;
+```
+
 ### 12.2 The 64-Day Metadata Cache & FORCE
 
 Snowflake tracks ingested files in a **64-day metadata cache**. Re-running `COPY INTO` on an already-loaded file **does nothing** by default (it's silently skipped) — unless you override with:
@@ -601,7 +657,23 @@ COPY INTO @STG_CSV/customer_export/ FROM customer;
 COPY INTO @STG_CSV/Megan_Fox/ FROM customer VALIDATION_MODE = RETURN_ROWS;
 ```
 
-### 13.3 Copying Files Between Stages Directly
+### 13.3 Putting the Unload Parameters Together
+
+A realistic unload combines several of the parameters above in one statement:
+
+```sql
+COPY INTO @STG_CSV/customer_export/
+FROM customer
+FILE_FORMAT = (TYPE = CSV)
+SINGLE = FALSE                -- parallel unload into multiple numbered files (default)
+MAX_FILE_SIZE = 5368709120    -- 5GB max per file (external stage upper limit)
+OVERWRITE = TRUE              -- replace any existing files of the same name
+INCLUDE_QUERY_ID = TRUE       -- stamp the unique Query ID into each output filename
+DETAILED_OUTPUT = TRUE        -- return filenames, row counts, and file sizes
+HEADER = TRUE;                -- write column names as the first row
+```
+
+### 13.4 Copying Files Between Stages Directly
 
 ```sql
 COPY FILES INTO @STG_DATA FROM @STG_CSV;
@@ -740,7 +812,10 @@ AS
 ```sql
 -- Check pipe status (pending files, last ingested file, etc.)
 SELECT SYSTEM$PIPE_STATUS('aws_pipe');
+```
+This returns a JSON payload — key fields to inspect include `pendingFileCount` (files queued but not yet ingested), `lastIngestedFilePath` (most recently loaded file), and `lastReceivedMessageTimestamp` (when the last SQS notification arrived) — useful for diagnosing a pipe that appears "stuck."
 
+```sql
 -- Serverless credit usage over the last 7 days
 SELECT *
 FROM TABLE(information_schema.pipe_usage_history(
@@ -858,6 +933,21 @@ FILE_FORMAT = ingest_data;
 - **`AUTO_REBUILD = TRUE`** — Snowflake auto-refreshes the external table's file metadata when new files land.
 - **`PATTERN`** — filters which files within a stage directory get mapped into the external table.
 
+**Putting it together:**
+
+```sql
+CREATE OR REPLACE EXTERNAL TABLE ext_sales_partitioned (
+  country      VARCHAR AS (VALUE:c1::VARCHAR),
+  sales_date   DATE    AS (VALUE:c2::DATE),
+  amount       NUMBER  AS (VALUE:c3::NUMBER)
+)
+PARTITION BY (country, sales_date)   -- organizes/prunes by these folder-derived keys
+LOCATION = @aws_s3_stage/sales/
+AUTO_REBUILD = TRUE                  -- keep partition metadata in sync as new files land
+PATTERN = '.*sales_[0-9]{4}\.csv'    -- only map files matching this naming pattern
+FILE_FORMAT = (TYPE = CSV);
+```
+
 ---
 
 ## 20. Caching in Snowflake
@@ -930,6 +1020,8 @@ SELECT * FROM AWS_customer_load BEFORE(STATEMENT => 'query_id');
 -- 3. Absolute timestamp
 SELECT * FROM AWS_customer_load AT(TIMESTAMP => '2025-06-29 11:15:00'::timestamp_tz);
 ```
+
+> ⏰ **Timezone Gotcha:** Timestamps used in `AT(TIMESTAMP => ...)` are interpreted using the **session's local time zone**, which **defaults to `US/Pacific`** unless you've changed it. If your team is in a different timezone and forgets this, "restoring data as of 11:15 AM" can silently pull data from a completely different real-world moment than intended. Check/set it explicitly if needed: `ALTER SESSION SET TIMEZONE = 'Asia/Kolkata';`
 
 ### 21.5 The Classic "Recreated Table" Interview Trap
 
@@ -1026,6 +1118,13 @@ SELECT * EXCLUDE (acctbal, phone) FROM snowflake_sample_data.tpch_sf1.customer;
 - **Physically stores pre-computed results** in database storage — extra storage cost, but extremely fast reads.
 - Best when base tables don't change often but you query the aggregation frequently.
 - Snowflake **automatically maintains** materialized views in the background (serverless) whenever the base table changes.
+
+```sql
+CREATE MATERIALIZED VIEW mv_daily_order_totals AS
+SELECT order_date, SUM(amount) AS total_amount
+FROM orders
+GROUP BY order_date;
+```
 
 > ⚠️ **Critical Limitation:** A materialized view **cannot reference more than one table** — **no JOINs allowed**. It's strictly for single-table filters/aggregations. Attempting a JOIN throws: *"invalid materialized view definition: More than one table cannot be referenced."* Standard views have no such restriction.
 
@@ -1151,6 +1250,8 @@ If the stream is empty, the task skips entirely — no warehouse spins up, no cr
 
 **Privileges are never granted directly to users.** Privileges (e.g., `SELECT` on a table, `USAGE` on a warehouse) are granted to **roles**; users are then granted roles, and inherit whatever privileges those roles carry. This decouples security management from individual user management.
 
+> 📎 **Note — RBAC vs. DAC:** Snowflake's security model is primarily **Role-Based Access Control (RBAC)**, but it coexists with an element of **Discretionary Access Control (DAC)** — every securable object has an *owner* (by default, the role that created it), and that owner can independently grant privileges on the object to other roles at their own discretion, on top of the broader RBAC hierarchy.
+
 > 🎫 **Analogy — Access Badges, Not Name Tags**
 >
 > RBAC is like an office issuing colored access badges ("Finance," "Engineering," "Visitor") rather than programming the door locks to recognize each individual employee's face. When someone joins Finance, you just hand them the Finance badge — you don't reprogram every door in the building. If a policy changes (e.g., Finance now also needs access to Room 5B), you update the *badge's* permissions once, and everyone holding that badge is automatically updated.
@@ -1178,13 +1279,18 @@ GRANT ROLE bi_role TO USER katrina;
 -- 3. Grant database + warehouse usage
 GRANT USAGE ON DATABASE youtube_learning TO ROLE bi_role;
 
--- 4. Grant schema usage and table select
+-- 4. Grant warehouse usage — without this, the role has no compute to actually run queries
+GRANT USAGE ON WAREHOUSE compute_wh TO ROLE bi_role;
+
+-- 5. Grant schema usage and table select
 GRANT USAGE ON SCHEMA youtube_learning.raw_layer TO ROLE bi_role;
 GRANT SELECT ON ALL TABLES IN SCHEMA youtube_learning.raw_layer TO ROLE bi_role;
 
--- 5. Extend SELECT automatically to any FUTURE tables created in this schema
+-- 6. Extend SELECT automatically to any FUTURE tables created in this schema
 GRANT SELECT ON FUTURE TABLES IN SCHEMA youtube_learning.raw_layer TO ROLE bi_role;
 ```
+
+> ⚠️ **Common Gotcha:** Steps 3 and 5 (`USAGE` on the database/schema) and step 4 (`USAGE` on the warehouse) are all independently required. Granting `SELECT` on tables alone is not enough — without `USAGE` on the parent database/schema, the role can't even "see" its way down to the table; without `USAGE` on a warehouse, the role has no compute to actually execute the query.
 
 ---
 
@@ -1786,7 +1892,16 @@ SECRETS = ('cred' = tmdb_api_key)
 
 ### 43.4 Bulk Loading via Stored Procedures
 
-A Python Stored Procedure can handle **paginated** API calls, gather the JSON responses, and write raw records straight into a table. Since API arrays typically arrive as raw Python strings, use **`PARSE_JSON`** when inserting them, so the data lands in a properly indexable `VARIANT`/`ARRAY` column rather than as a plain text blob.
+A Python Stored Procedure can handle **paginated** API calls, gather the JSON responses, and write raw records straight into a table. Since API arrays typically arrive as raw Python strings, use **`PARSE_JSON`** when inserting them, so the data lands in a properly indexable `VARIANT`/`ARRAY` column rather than as a plain text blob:
+
+```sql
+-- Without PARSE_JSON, response_body would be stored as inert plain text
+INSERT INTO movies_raw (payload)
+SELECT PARSE_JSON(response_body)
+FROM staging_api_responses;
+```
+
+Once stored this way, the payload becomes a genuine `VARIANT`, so you can immediately query it with the same path/flatten syntax covered in Sections 8, 29, and 44 (e.g., `payload:title::string`, `LATERAL FLATTEN(input => payload:results)`).
 
 ---
 
