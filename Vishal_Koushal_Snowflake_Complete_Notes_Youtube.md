@@ -619,6 +619,111 @@ CREATE EXTERNAL TABLE ext_orders
 
 ## 10. Stages
 
+# Snowflake — What is a Stage?
+
+## Core Concept
+
+A **stage** in Snowflake is simply a storage location — a pointer to where your data files live — that Snowflake uses to **load data into tables** (or **unload data out of tables**).
+
+Think of it as a "waiting area" for files before they get copied into a Snowflake table.
+
+---
+
+## Analogy 🚪
+
+A stage is like the **loading dock of a warehouse**.
+
+Before goods (data files) get shelved inside the warehouse (a table), they sit on the loading dock first. Snowflake's `COPY INTO` command is the forklift that moves files from the dock into the shelves.
+
+---
+
+## Types of Stages
+
+| Type | What it is |
+|---|---|
+| **Internal Stage** | Storage managed *inside* Snowflake itself. No external cloud account needed. |
+| **External Stage** | Points to storage you already own — an S3 bucket, Azure Blob container, or GCS bucket. |
+
+### Internal Stage — 3 Sub-Types
+
+| Sub-type | Scope | Notes |
+|---|---|---|
+| **User Stage** (`@~`) | Tied to one user | Every user gets one automatically; can't be dropped or altered; not shareable |
+| **Table Stage** (`@%table_name`) | Tied to one specific table | Auto-created with the table; files loaded here can only go into that one table |
+| **Named Stage** (`@stage_name`) | Independent object | Most flexible — usable by multiple tables/users, supports granting privileges, can set default file formats |
+
+---
+
+## Basic Examples
+
+### Internal Named Stage
+
+```sql
+-- Create a named internal stage
+CREATE STAGE my_stage;
+
+-- List files sitting in the stage
+LIST @my_stage;
+
+-- Load data from stage into a table
+COPY INTO my_table
+FROM @my_stage
+FILE_FORMAT = (TYPE = 'CSV');
+```
+
+### External Stage (S3 example)
+
+```sql
+CREATE STAGE my_s3_stage
+  URL = 's3://my-bucket/data/'
+  CREDENTIALS = (AWS_KEY_ID = '...' AWS_SECRET_KEY = '...');
+```
+
+---
+
+## Key Points to Remember
+
+- 📌 A stage doesn't hold *table data* — it holds raw **files** (CSV, JSON, Parquet, etc.) before/after they're loaded.
+- 📌 `PUT` command uploads local files into an internal stage; `GET` downloads files back out.
+- 📌 `COPY INTO <table>` moves data **from** a stage **into** a table; `COPY INTO <stage>` unloads data **from** a table **into** a stage (for export).
+- 📌 A **table stage** cannot be referenced by other tables — it's private to that one table.
+- 📌 A **user stage** cannot be altered or have file format options set — meant for personal, quick use only.
+- 📌 **Named stages** are the most commonly used in real pipelines because they're reusable and support access control via `GRANT`.
+
+---
+
+## Quick Summary Table
+
+| Stage Type | Reference Syntax | Shareable? | Alterable? |
+|---|---|---|---|
+| User Stage | `@~` | ❌ No | ❌ No |
+| Table Stage | `@%table_name` | ❌ No | ❌ No |
+| Named Internal Stage | `@stage_name` | ✅ Yes | ✅ Yes |
+| Named External Stage | `@stage_name` | ✅ Yes | ✅ Yes |
+
+---
+
+## Interview Q&A
+
+**Q1. What is a stage in Snowflake?**
+> A: A storage location (internal or external) that acts as a staging/waiting area for data files before they're loaded into a table, or after they're unloaded from one.
+
+**Q2. What's the difference between an internal and external stage?**
+> A: Internal stages are storage managed by Snowflake itself. External stages point to storage you already own in a cloud provider — S3, Azure Blob, or GCS.
+
+**Q3. What are the three types of internal stages?**
+> A: User stage (`@~`), table stage (`@%table_name`), and named stage (`@stage_name`).
+
+**Q4. Can a table stage be used to load data into a different table?**
+> A: No — a table stage is private to the one table it's tied to.
+
+**Q5. Which stage type supports `GRANT`-based access control?**
+> A: Only named stages — user stages and table stages can't have privileges granted on them separately.
+
+**Q6. What command uploads a local file into a Snowflake stage?**
+> A: `PUT` — and `GET` is used to download files back out of a stage.
+
+
 A **Stage** is an intermediate landing zone — really a **pointer/metadata object** — where files sit before being copied into a table (or unloaded from a table into external storage).
 
 ### 10.1 Types of Stages
