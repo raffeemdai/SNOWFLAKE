@@ -401,6 +401,75 @@ CREATE OR REPLACE WAREHOUSE my_wh
 
 `MIN_CLUSTER_COUNT` / `MAX_CLUSTER_COUNT` greater than 1 is what actually turns this into a **Multi-cluster Warehouse** capable of horizontal scaling (Section 5.2); leaving both at `1` keeps it a single-cluster warehouse that can only scale vertically by resizing.
 
+
+
+# Snowflake — Default Warehouse Size When Not Specified
+
+## Core Rule
+
+If you don't specify `WAREHOUSE_SIZE` while creating a warehouse, Snowflake automatically defaults it to:
+
+> 🔑 **`XSMALL`** — for a **STANDARD** warehouse
+
+```sql
+CREATE WAREHOUSE my_wh;
+-- Creates a STANDARD, XSMALL warehouse by default
+```
+
+---
+
+## Important Exception — Snowpark-Optimized Warehouses
+
+The `XSMALL` default only applies to **standard** warehouses.
+
+If you create a **Snowpark-optimized** warehouse without specifying a size, it defaults to **MEDIUM** instead — because Snowpark workloads need more memory/compute to function properly.
+
+```sql
+CREATE WAREHOUSE so_wh WITH WAREHOUSE_TYPE = 'SNOWPARK-OPTIMIZED';
+-- Creates a SNOWPARK-OPTIMIZED, MEDIUM warehouse by default
+```
+
+---
+
+## Other Useful Defaults (When Left Unspecified)
+
+| Property | Default Value |
+|---|---|
+| `WAREHOUSE_SIZE` (standard) | **XSMALL** |
+| `WAREHOUSE_SIZE` (Snowpark-optimized) | **MEDIUM** |
+| `WAREHOUSE_TYPE` | `STANDARD` |
+| `AUTO_SUSPEND` | `600` seconds (10 minutes) |
+| `AUTO_RESUME` | `TRUE` |
+| `INITIALLY_SUSPENDED` | `FALSE` (warehouse starts running immediately) |
+| `MAX_CLUSTER_COUNT` | `1` (single-cluster) |
+| `MIN_CLUSTER_COUNT` | `1` |
+| `SCALING_POLICY` | `STANDARD` |
+
+---
+
+## Quick Notes
+
+- 📌 Creating a warehouse **automatically sets it as the active warehouse** for the current session — equivalent to running `USE WAREHOUSE` right after.
+- 📌 `AUTO_SUSPEND` uses a background check that runs ~every 30 seconds, so values under 30 (or non-multiples of 30) may not behave precisely as set.
+- 📌 Setting `AUTO_SUSPEND = 0` or `NULL` means the warehouse **never suspends** — not recommended unless workloads genuinely require a continuously running warehouse (credit cost risk).
+- 📌 `INITIALLY_SUSPENDED = FALSE` by default means a brand-new warehouse **starts consuming credits immediately** unless you explicitly suspend it or set `INITIALLY_SUSPENDED = TRUE`.
+
+---
+
+## Interview Q&A
+
+**Q1. If you run `CREATE WAREHOUSE my_wh;` with no other options, what size warehouse gets created?**
+> A: `XSMALL` — the default size for a standard warehouse.
+
+**Q2. Does the same default apply to Snowpark-optimized warehouses?**
+> A: No. Snowpark-optimized warehouses default to `MEDIUM` instead of `XSMALL`, since they need more memory and compute for Snowpark workloads.
+
+**Q3. If you don't set `INITIALLY_SUSPENDED`, will the new warehouse be running or suspended?**
+> A: Running. The default is `FALSE`, meaning the warehouse starts active immediately and begins consuming credits.
+
+**Q4. What is the default `AUTO_SUSPEND` value, and why does it matter?**
+> A: 600 seconds (10 minutes) of inactivity. It matters because it prevents idle warehouses from silently burning credits.
+
 ---
 
 # Part B — Database Objects, Data Types & Loading
