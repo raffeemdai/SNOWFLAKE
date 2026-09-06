@@ -2249,3 +2249,185 @@ The core building blocks form a clear progression:
 > 🔑 **One-Line Takeaway**
 >
 > Snowflake's entire architecture — from micro-partitions to Time Travel to Zero-Copy Cloning to Dynamic Tables — is built around one repeated idea: **store data once, immutably, and layer cheap metadata (pointers, bookmarks, tags, masking rules) on top of it to get performance, history, security, and automation almost for free.**
+
+
+
+# Snowflake Storage Lifecycle Tiers — Standard, Cool & Cold
+
+> **Quick correction/note:** Snowflake's official tier names are **STANDARD**, **COOL**, and **COLD** (not "Cooler"). This guide uses the correct, verified names throughout so you don't carry a wrong term into an interview or a real project.
+
+---
+
+## 1. The Problem This Solves (Theory)
+
+Every company collects data it *must* keep (compliance, audits, logs, historical records) but rarely *touches* again. Keeping all of it in expensive, always-hot storage forever is wasteful.
+
+Snowflake's answer is **Storage Lifecycle Policies** — a schema-level object that automatically moves old, rarely-accessed rows out of expensive standard storage into cheaper **archive tiers** (COOL or COLD), and can even auto-delete data once it's no longer needed for compliance.
+
+Two policy types:
+- **Archival policy** → move rows to COOL or COLD tier for a set number of days, then optionally delete.
+- **Expiration policy** → just delete rows directly, no archiving.
+
+> 🔑 **Important:** This is *row-level* automation — Snowflake evaluates each row daily against your policy expression, not the whole table at once.
+
+---
+
+## 2. Simple Analogy — Your Kitchen 🍳
+
+Think of your data like food in your house:
+
+| Storage Tier | Kitchen Analogy | Behavior |
+|---|---|---|
+| **STANDARD** | The **fridge** | Food you use every day. Instantly available. Most expensive space per square inch. |
+| **COOL** | The **garage freezer** | Food you don't need daily, but when you do want it, you get it fast. Cheaper than fridge space. |
+| **COLD** | A **rented storage locker** across town | Cheapest place to keep things long-term, but you have to drive over and it takes time (up to 2 days) to bring items back. |
+
+👉 The more "distant" the storage, the cheaper it is — but the longer it takes to get your data back when you need it.
+
+---
+
+## 3. The Three Tiers — Detailed Comparison
+
+| Feature | STANDARD | COOL | COLD |
+|---|---|---|---|
+| **Purpose** | Active, everyday data | Infrequently accessed, must retain | Long-term retention, rarely touched |
+| **Retrieval speed** | Instant | Fast / near-instant | Up to **48 hours** |
+| **Cost vs Standard** | Baseline (highest) | ~67–77% cheaper | Up to **90% cheaper** (≈4x cheaper than COOL) |
+| **Minimum archival period** | N/A | **90 days** | **180 days** |
+| **Direct querying?** | ✅ Yes | ❌ No — must retrieve first | ❌ No — must retrieve first |
+| **Cloud availability** | All | AWS, Azure, GCP | AWS, GCP only (not Azure) |
+| **Best for** | Daily transactional/reporting data | Data accessed quarterly/semi-annually | Data accessed annually or less (e.g., compliance archives) |
+
+> 🔑 **Highlight — Archive tier is PERMANENT per table:** Once you attach a COOL or COLD policy to a table, you **cannot switch tiers** later. You'd need to drop and recreate the policy, and even then a table can only ever use **one** archive tier for its lifetime.
+
+> 🔑 **Highlight — Archived data is not directly queryable.** You must explicitly restore it using `CREATE TABLE ... FROM ARCHIVE OF` before you can run SQL on it again.
+
+> 🔑 **Highlight — Early deletion penalty:** If you delete archived data before its `ARCHIVE_FOR_DAYS` period ends, you're still billed for the unused committed time (similar to cloud storage "minimum duration" charges).
+
+---
+
+## 4. SQL Syntax & Query Examples
+
+### Step 1 — Create a policy
+
+```sql
+CREATE STORAGE LIFECYCLE POLICY archive_closed_accounts
+  AS (event_ts TIMESTAMP, account_id NUMBER)
+  RETURNS BOOLEAN ->
+    event_ts < DATEADD(DAY, -60, CURRENT_TIMESTAMP())
+    AND EXISTS (
+      SELECT 1 FROM closed_accounts
+      WHERE id = account_id
+    )
+  ARCHIVE_TIER = COOL
+  ARCHIVE_FOR_DAYS = 180;
+```
+
+**What this does:** any row older than 60 days that belongs to a closed account gets archived into the **COOL** tier and kept there for 180 days before permanent deletion.
+
+### Step 2 — Attach the policy to a table
+
+```sql
+ALTER TABLE my_table
+  ADD STORAGE LIFECYCLE POLICY archive_closed_accounts;
+```
+
+### Step 3 — Retrieve archived data when you need it
+
+```sql
+CREATE TRANSIENT TABLE order_restore
+  FROM ARCHIVE OF orders
+  WHERE order_date BETWEEN '2024-03-15' AND '2024-03-25';
+```
+
+This copies just the rows matching your `WHERE` clause into a brand-new table — you never query the archive directly.
+
+### Example — COLD tier for long-term compliance data
+
+```sql
+CREATE STORAGE LIFECYCLE POLICY archive_old_logs
+  AS (log_date DATE)
+  RETURNS BOOLEAN ->
+    log_date < DATEADD(DAY, -360, CURRENT_DATE())
+  ARCHIVE_TIER = COLD
+  ARCHIVE_FOR_DAYS = 1825;  -- keep for 5 years before deletion
+```
+
+### Checking archive metadata (no retrieval cost)
+
+```sql
+SELECT SYSTEM$GET_TABLE_ARCHIVE_METADATA('my_table');
+```
+
+Use this to peek at row counts / min-max values in the archive **without** paying retrieval costs.
+
+### Monitoring policy runs
+
+```sql
+SELECT *
+FROM TABLE(INFORMATION_SCHEMA.STORAGE_LIFECYCLE_POLICY_HISTORY(
+  POLICY_NAME => 'archive_closed_accounts'
+));
+```
+
+> 🔑 **Highlight:** Policies run automatically ~once per day on Snowflake's shared compute — no warehouse needed, no manual scripts, no orchestration tool required.
+
+---
+
+## 5. Notable Behaviors & Gotchas (Notes Worth Remembering)
+
+- 📌 A policy attached to a table **locks UPDATE/DELETE/MERGE** while it's running (INSERT and COPY still work fine).
+- 📌 **Cloning** doesn't carry over archived data — the policy only applies to rows in that specific physical table, not its clones. This means clone + archive = you may pay for storage in *both* tiers.
+- 📌 **Replication/failover:** archived COOL/COLD data is **not replicated**. If you fail over to a secondary account, that archived data isn't there.
+- 📌 **Transient tables have no Fail-safe** — once archived data from a transient table expires or is dropped, it's gone for good, no support recovery possible.
+- 📌 Large archive/expire jobs run **incrementally** — a huge table might take several daily runs to fully process, not just one.
+- 📌 Not supported on: shared tables (provider/consumer), Native Apps, external-access UDFs, Python/Java/Scala UDFs, or tables using row timestamps.
+
+---
+
+## 6. Interview Questions & Answers
+
+**Q1. What are Snowflake's storage tiers under Storage Lifecycle Policies?**
+> A: STANDARD (default, active storage), and two archive tiers — COOL and COLD — used for infrequently accessed data that still needs to be retained.
+
+**Q2. What's the core difference between COOL and COLD tiers?**
+> A: COOL offers near-instant retrieval and is used for data accessed a few times a year; it needs a minimum 90-day archival period. COLD is roughly 4x cheaper than COOL but retrieval can take up to 48 hours, and it requires a minimum 180-day archival period.
+
+**Q3. Can you query archived (COOL/COLD) data directly with a normal SELECT?**
+> A: No. Archived rows aren't directly queryable. You must run `CREATE TABLE ... FROM ARCHIVE OF <table> WHERE <condition>` to restore the specific rows you need into a new table first.
+
+**Q4. Can you switch a table's archive tier from COOL to COLD later?**
+> A: No. Once a policy with a given archive tier is attached to a table, that tier is permanent for the table's lifetime. You'd need Snowflake Support to delete the existing archive before a different tier could be applied.
+
+**Q5. What happens if you delete archived data before the ARCHIVE_FOR_DAYS period ends?**
+> A: You're still charged for the remaining committed storage duration — an "early deletion" / minimum-duration penalty, similar to cold storage penalties on AWS/Azure/GCP.
+
+**Q6. Is Storage Lifecycle Policy an expiration or archival tool?**
+> A: It can be either. If you set `ARCHIVE_TIER` and `ARCHIVE_FOR_DAYS`, it's an archival policy. If you omit `ARCHIVE_TIER`, it becomes a pure expiration policy that deletes matching rows outright.
+
+**Q7. What object types support storage lifecycle policies?**
+> A: Standard tables, transient tables, interactive tables (non-auto-refresh), and dynamic tables. Not supported on shared tables, Native Apps, or tables with external-access/Python/Java/Scala UDFs.
+
+**Q8. How often does Snowflake run these policies?**
+> A: Automatically, about once per day, using Snowflake's own shared compute resources — you don't need to spin up or manage a warehouse for this.
+
+**Q9. Why would an organization choose COLD over COOL despite the retrieval delay?**
+> A: Pure cost optimization — for data that's accessed annually or less (e.g., 7-year compliance logs), COLD's ~90% savings vs. standard storage outweighs the 48-hour retrieval wait, since that data is rarely, if ever, urgently needed.
+
+**Q10. What SQL command lets you check archive stats without incurring retrieval cost?**
+> A: `SYSTEM$GET_TABLE_ARCHIVE_METADATA()` — it returns things like row count and column min/max values from the archive without actually pulling the data back.
+
+---
+
+## 7. One-Line Cheat Sheet
+
+- **STANDARD** = fridge → instant, priciest
+- **COOL** = garage freezer → fast, 90-day min, ~70% cheaper
+- **COLD** = storage locker → up to 48h wait, 180-day min, ~90% cheaper
+- Archive tier is **permanent per table** — choose carefully
+- Archived data needs `FROM ARCHIVE OF` to restore before querying
+- Policies run **daily**, automatically, on shared compute — zero manual ops
+
+---
+
+*Sources: Snowflake official blog — "Optimize Storage Costs and Simplify Compliance with Storage Lifecycle Policies, Now GA" (Oct 2025) and Snowflake Documentation — Storage Lifecycle Policies & CREATE STORAGE LIFECYCLE POLICY reference.*
