@@ -176,6 +176,66 @@ When you run `SELECT * FROM customer`:
 
 Every query's profile (visible via the Query ID) shows compilation time, provisioning time, execution time, rows scanned, and caching behavior.
 
+
+# Snowflake Query ID — Uniqueness Per Execution
+
+## Core Concept
+
+In Snowflake, **every single query execution gets its own unique Query ID** — even if it's byte-for-byte the same SQL statement run back-to-back by the same user.
+
+> 🔑 **Key rule:** Query ID uniqueness is **per-execution**, not per-statement-text.
+
+---
+
+## Key Details
+
+- **Format:** Query IDs are UUIDs, e.g. `01b2f3a4-0000-1234-0000-abcdef123456`
+
+- **Where to find them:**
+  - Snowflake UI → **Snowsight → Query History**
+  - `SELECT LAST_QUERY_ID();` — right after running a statement
+  - `QUERY_HISTORY` view/table function in `ACCOUNT_USAGE` / `INFORMATION_SCHEMA`
+
+- **Why it matters:** Query ID is your handle for almost everything post-execution:
+  - Checking query profile / execution plan
+  - Cancelling a running query → `SYSTEM$CANCEL_QUERY`
+  - Checking status → `SYSTEM$GET_QUERY_STATUS`
+  - Pulling result sets again → `RESULT_SCAN(query_id)`
+
+---
+
+## Result Caching Nuance (Important!)
+
+Even when Snowflake serves a result from the **result cache** — same query, same unchanged underlying data, within 24 hours, same session context — instead of recomputing it, it still generates a **new Query ID** for that execution.
+
+You'll notice:
+- `bytes_scanned = 0`
+- Very fast execution time in the query profile
+- A **"Result reused"** indicator
+
+👉 The identical query text does **not** collapse into one shared ID.
+
+---
+
+## RESULT_SCAN — Where the Old Query ID Becomes Useful
+
+```sql
+SELECT * FROM TABLE(RESULT_SCAN('<query_id>'));
+```
+
+This lets you re-fetch a **previous** result set without re-running anything.
+
+> 🔑 Note: This `RESULT_SCAN` call itself also generates its **own new Query ID**.
+
+---
+
+## Quick Summary
+
+| Scenario | New Query ID? |
+|---|---|
+| Same SQL run twice by same user | ✅ Yes |
+| Result served from result cache | ✅ Yes (still new ID) |
+| Using `RESULT_SCAN()` to reuse old results | ✅ Yes (the scan call itself gets a new ID) |
 ---
 
 ## 3. Account Setup & Pricing
