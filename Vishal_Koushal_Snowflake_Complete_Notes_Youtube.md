@@ -619,6 +619,289 @@ CREATE EXTERNAL TABLE ext_orders
 
 ## 10. Stages
 
+# Part A — Stages
+
+## A1. What is a Stage?
+
+A **stage** in Snowflake is a location used to store data files for loading data *into* Snowflake tables or unloading data *out of* Snowflake tables.
+
+```text
+Source Files
+     ↓
+   Stage
+     ↓
+Snowflake Table
+```
+
+Stages are used with commands such as:
+
+```sql
+PUT
+GET
+COPY INTO
+```
+
+---
+
+## A2. Internal Stage
+
+An **Internal Stage** is a storage location fully managed by **Snowflake**. Files sit in Snowflake-managed cloud storage — Snowflake handles the underlying bucket/container for you.
+
+### Types of Internal Stages
+
+**a) User Stage (`@~`)** — every user automatically has one. Cannot be dropped, altered, or shared with other users.
+```sql
+PUT file://C:\data\employee.csv @~;
+COPY INTO employee FROM @~;
+```
+
+**b) Table Stage (`@%table_name`)** — every table automatically has its own stage, tied 1:1 to that table. It is dropped automatically when the table is dropped.
+```sql
+PUT file://C:\data\employee.csv @%employee;
+COPY INTO employee FROM @%employee;
+```
+
+**c) Named Internal Stage** — explicitly created, independent of any specific user/table; can be shared across users/roles via grants.
+```sql
+CREATE STAGE my_internal_stage;
+PUT file://C:\data\employee.csv @my_internal_stage;
+COPY INTO employee FROM @my_internal_stage;
+```
+
+---
+
+## A3. External Stage
+
+An **External Stage** points to storage *outside* Snowflake, in cloud storage you/your org own and manage:
+
+- Amazon S3
+- Microsoft Azure Blob Storage
+- Google Cloud Storage (GCS)
+
+```sql
+CREATE STAGE my_external_stage
+  URL = 's3://my-bucket/data/'
+  STORAGE_INTEGRATION = my_s3_integration;
+
+COPY INTO employee
+FROM @my_external_stage;
+```
+
+> **Note:** Files are uploaded to external cloud storage directly (AWS CLI, S3 console, Azure Storage Explorer, etc.) — the `PUT` command does **not** work against external stages, since Snowflake doesn't own that storage.
+
+---
+
+## A4. Internal vs External — Comparison Table
+
+| Feature | Internal Stage | External Stage |
+|---|---|---|
+| Storage location | Snowflake-managed storage | External cloud storage (your bucket) |
+| Managed by | Snowflake | Cloud provider / customer |
+| Examples | User, Table, Named Stage | S3, Azure Blob, GCS |
+| File upload method | `PUT` command | Uploaded directly to cloud storage (not via `PUT`) |
+| Access outside Snowflake | Not possible — Snowflake-only | Yes — other tools/apps can read the same files |
+| Setup complexity | Simple, no extra setup | Needs storage integration + bucket permissions |
+| Cost | Bundled into Snowflake storage billing | Billed separately by the cloud provider |
+| Best for | Temporary, manual, dev/test loading | Enterprise-scale, automated, shared pipelines / data lakes |
+| Storage Integration required | No | Commonly used (recommended for secure access) |
+| Auto-created | User & Table stages: yes; Named stage: no | No — always explicitly created |
+| Shareable across users/roles | Named internal stage only | Yes (via grants on the stage object) |
+| Works with Snowpipe | Yes (less common) | Yes (most common pattern) |
+| Data residency / compliance control | Limited — Snowflake controls it | Full control — useful for compliance needs |
+
+---
+
+## A5. Data Flow Diagrams
+
+### Internal Stage
+```text
+Local File
+    │  PUT
+    ▼
+Snowflake Internal Stage
+    │  COPY INTO
+    ▼
+Snowflake Table
+```
+```sql
+PUT file://C:\data\employee.csv @my_internal_stage;
+COPY INTO employee FROM @my_internal_stage;
+```
+
+### External Stage
+```text
+Application / Source
+        │
+        ▼
+Amazon S3 / Azure Blob / GCS
+        │
+        ▼
+Snowflake External Stage
+        │  COPY INTO
+        ▼
+Snowflake Table
+```
+```sql
+COPY INTO employee FROM @my_external_stage;
+```
+
+---
+
+## A6. When to Use Which
+
+### Use an Internal Stage when:
+- Files are small or temporary
+- You want Snowflake to manage the storage
+- You're manually loading files (e.g., via SnowSQL `PUT`)
+- You're doing dev/test work
+- You don't need/want a separate cloud storage account
+- Nothing outside Snowflake needs to read the files
+
+```sql
+CREATE STAGE dev_stage;
+PUT file://C:\data\test.csv @dev_stage;
+COPY INTO test_table FROM @dev_stage;
+```
+
+### Use an External Stage when:
+- Your org already stores files in S3 / Azure Blob / GCS
+- You have large-scale, recurring pipelines
+- Multiple applications/teams need access to the same files
+- You want automated, event-driven ingestion (Snowpipe)
+- Compliance requires control over exactly where data physically lives
+
+```text
+Application
+     ↓
+Cloud Storage (S3 / Azure / GCS)
+     ↓
+External Stage
+     ↓
+Snowpipe / COPY INTO
+     ↓
+Snowflake Table
+```
+
+### Rule of Thumb
+> If Snowflake is the **only** consumer of the data → **Internal Stage**.
+> If the data is shared across systems or part of a bigger data lake → **External Stage**.
+
+---
+
+## A7. Storage Integration
+
+A **Storage Integration** is a Snowflake object that securely allows Snowflake to access external cloud storage, avoiding embedding cloud credentials (access keys/secrets) directly in SQL/stage definitions. It relies on cloud-provider IAM roles / service principals instead.
+
+```sql
+CREATE STORAGE INTEGRATION my_s3_integration
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = 'S3'
+  ENABLED = TRUE
+  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::123456789012:role/my-role'
+  STORAGE_ALLOWED_LOCATIONS = ('s3://my-bucket/data/');
+
+CREATE STAGE my_external_stage
+  URL = 's3://my-bucket/data/'
+  STORAGE_INTEGRATION = my_s3_integration;
+```
+
+---
+
+## A8. Simplified Recap
+
+Think of a stage as a **"waiting area"** for files before they're loaded into a table (or after they're unloaded out of one).
+
+- **Internal Stage** = storage *inside* Snowflake. Snowflake manages it completely — no cloud account of your own required.
+- **External Stage** = a pointer to a bucket in *your own* cloud storage. Snowflake just "looks into" it; it doesn't own the storage.
+
+**Analogy:**
+- Internal stage = a locker inside Snowflake's building — only Snowflake has the key.
+- External stage = your own storage unit outside — Snowflake has a key, but so can other tools/people.
+
+---
+
+## A9. Interview Q&A Bank (Stages)
+
+**Q1. What is a stage in Snowflake?**
+A location (internal or external) where data files are stored temporarily before loading into Snowflake tables, or after unloading from them.
+
+**Q2. What are the types of internal stages?**
+User stage (`@~`), Table stage (`@%table_name`), Named internal stage (`CREATE STAGE`).
+
+**Q3. What's the main difference between internal and external stage?**
+Internal stage storage is managed by Snowflake; external stage storage lives in the customer's own cloud storage (S3/Azure/GCS), and Snowflake only references it.
+
+**Q4. Can you access files in an internal stage from outside Snowflake?**
+No — only through Snowflake (SQL, SnowSQL, drivers, `PUT`/`GET`).
+
+**Q5. What is a storage integration, and why is it needed for external stages?**
+A Snowflake object holding a generated identity (IAM role/service principal) used to securely authenticate to cloud storage, so credentials aren't hardcoded in the stage definition.
+
+**Q6. Which is cheaper — internal or external stage?**
+Depends on scale. Internal costs are bundled into Snowflake storage pricing; external is billed directly by the cloud provider — often cheaper at large scale since you control storage tiers/lifecycle rules.
+
+**Q7. Can the same external bucket be used by other tools besides Snowflake?**
+Yes — a key advantage, since it's your own cloud bucket, other systems (Spark, other DBs, apps) can access the same files.
+
+**Q8. How do you load data into Snowflake using a stage?**
+```sql
+COPY INTO my_table
+FROM @my_stage
+FILE_FORMAT = (TYPE = 'CSV');
+```
+
+**Q9. What commands are used with internal stages but not external ones?**
+`PUT` (upload local file to internal stage) and `GET` (download from internal stage). External stages don't use `PUT`/`GET` since files are managed directly via the cloud provider's own tools.
+
+**Q10. Why would a company choose an external stage despite the extra setup?**
+Compliance/data residency control, integration with an existing data lake, sharing files across multiple tools, and potentially lower cost at scale.
+
+**Q11. Is data automatically encrypted in internal stages?**
+Yes — Snowflake automatically encrypts data at rest in internal stages using Snowflake-managed keys.
+
+**Q12. Can you list files in a stage?**
+```sql
+LIST @my_stage;
+```
+
+**Q13. What is the difference between a User Stage and a Table Stage?**
+A User Stage belongs to a specific user (`@~`) and isn't tied to any table. A Table Stage belongs to a specific table (`@%table_name`) and is auto-dropped if the table is dropped.
+
+**Q14. What is a Named Stage?**
+A reusable stage explicitly created with `CREATE STAGE`. It can be internal or external, and — unlike user/table stages — its access can be granted to other roles/users.
+
+**Q15. Can Snowpipe use a stage?**
+Yes — Snowpipe loads files from a configured stage (typically external) into Snowflake tables automatically as new files arrive.
+```text
+Cloud Storage → External Stage → Snowpipe → Snowflake Table
+```
+
+---
+
+## A10. Key Summary
+
+```text
+INTERNAL STAGE
+---------------
+→ Storage managed by Snowflake
+→ User Stage, Table Stage, Named Internal Stage
+→ Files uploaded via PUT
+→ Best for temporary, dev/test, or manual loading
+
+EXTERNAL STAGE
+---------------
+→ Storage outside Snowflake (S3 / Azure Blob / GCS)
+→ Files uploaded directly to cloud storage (not via PUT)
+→ Requires a Storage Integration for secure access (recommended)
+→ Best for enterprise-scale, automated pipelines
+→ Commonly paired with Snowpipe for continuous loading
+```
+
+### One-Line Answer
+> An Internal Stage stores files in Snowflake-managed storage, whereas an External Stage references files stored in external cloud storage such as Amazon S3, Azure Blob Storage, or Google Cloud Storage.
+
+---
+
 # Snowflake — What is a Stage?
 
 ## Core Concept
