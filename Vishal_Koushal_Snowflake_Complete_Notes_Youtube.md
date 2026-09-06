@@ -1197,6 +1197,193 @@ COPY FILES INTO @STG_DATA FROM @STG_CSV;
 ```
 Moves files between stages without downloading them locally.
 
+# Snowflake COPY INTO — Key Options Explained
+## ERROR_ON_COLUMN_COUNT_MISMATCH, FORCE, PURGE, MATCH_BY_COLUMN_NAME, PARSE_HEADER
+
+---
+
+## ⚠️ Important Clarification First
+
+Not all five of these live in the same place:
+
+| Option | Belongs to |
+|---|---|
+| `ERROR_ON_COLUMN_COUNT_MISMATCH` | **File Format** option (can be inline in `COPY INTO ... FILE_FORMAT=(...)`) |
+| `FORCE` | **COPY INTO** copy option |
+| `PURGE` | **COPY INTO** copy option |
+| `MATCH_BY_COLUMN_NAME` | **COPY INTO** copy option |
+| `PARSE_HEADER` | **File Format** option (set in `CREATE FILE FORMAT` or inline `FILE_FORMAT=(...)`), NOT a direct `COPY INTO` copy option |
+
+👉 In practice people write them all inside one `COPY INTO` statement, but Snowflake internally treats `ERROR_ON_COLUMN_COUNT_MISMATCH` and `PARSE_HEADER` as **file format properties**.
+
+---
+
+## 1. `ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE`
+
+**What it does:** By default (`TRUE`), if the number of columns in your file doesn't exactly match the number of columns in the target table, the load **fails**. Setting it to `FALSE` tells Snowflake to tolerate that mismatch instead of aborting.
+
+**Analogy:** Like a bouncer who normally rejects anyone not on the exact guest list count — set this to `FALSE` and the bouncer becomes lenient about headcount.
+
+**When to use it:** Very commonly required alongside `MATCH_BY_COLUMN_NAME` + `PARSE_HEADER` for CSV — Snowflake explicitly requires this combination for CSV schema evolution to work.
+
+---
+
+## 2. `FORCE = TRUE`
+
+**What it does:** Reloads files even if Snowflake's internal load metadata shows they were already loaded before (bypasses the standard duplicate-file check).
+
+**Analogy:** Like force-resending an email even though the system says "already sent."
+
+**Caution:** Can cause **duplicate rows** if you're not careful — use it deliberately, not as a default habit.
+
+---
+
+## 3. `PURGE = TRUE`
+
+**What it does:** After a successful load, Snowflake automatically **deletes the source files from the stage**.
+
+**Analogy:** Like a shredder that destroys documents right after they're filed away — keeps your stage clean and avoids accidental reprocessing.
+
+**Caution:** Irreversible. If you might need the raw file again (audits, reprocessing, debugging), don't purge — archive it elsewhere first.
+
+---
+
+## 4. `MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE`
+
+**What it does:** Instead of loading columns **by position** (1st file column → 1st table column, etc.), Snowflake matches columns **by name**, ignoring case differences (`Name` in file = `NAME` in table = `name` in table — all treated the same).
+
+**Options:** `CASE_SENSITIVE`, `CASE_INSENSITIVE`, or `NONE` (default — positional loading).
+
+**Analogy:** Like matching people to seats using their name tag instead of "whoever walks in first sits in seat 1" — order no longer matters.
+
+**Note:** Extra columns in the file that don't exist in the table are ignored; extra columns in the table that aren't in the file get `NULL`.
+
+---
+
+## 5. `PARSE_HEADER = TRUE`
+
+**What it does:** A **file format** setting telling Snowflake to treat the file's first row as column headers (names) instead of data — required for header-based matching to work at all.
+
+**Important restriction:** `PARSE_HEADER = TRUE` **cannot** be combined with `SKIP_HEADER` — they conflict, since `PARSE_HEADER` already consumes the header row for its own purpose.
+
+**Analogy:** Like reading the labels on file folders before sorting them into cabinets, instead of just guessing what's in each folder by its position in the stack.
+
+---
+
+## 📊 Quick Comparison Table
+
+| Option | Purpose | Risk if misused | Belongs to |
+|---|---|---|---|
+| `ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE` | Tolerates column-count mismatch | Silently loads malformed/incomplete data | File Format |
+| `FORCE = TRUE` | Re-loads already-loaded files | Duplicate rows | COPY option |
+| `PURGE = TRUE` | Deletes files from stage after load | Permanent data loss if reprocessing needed | COPY option |
+| `MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE` | Loads columns by name, not position | Wrong mapping if names typo'd | COPY option |
+| `PARSE_HEADER = TRUE` | Uses row 1 as column headers | Fails if combined with `SKIP_HEADER` | File Format |
+
+---
+
+## 🧪 Prepare a Table + Full Working Example
+
+### Step 1 — Sample file (`students.csv`)
+
+```
+Name,Department,CGPA
+Ananya,CSE,8.9
+Rahul,ECE,8.4
+```
+
+### Step 2 — Create target table (note: different column order/case than the file — this is intentional to demonstrate `MATCH_BY_COLUMN_NAME`)
+
+```sql
+CREATE OR REPLACE TABLE students (
+    department STRING,
+    name STRING,
+    cgpa FLOAT
+);
+```
+
+### Step 3 — Create a stage and file format
+
+```sql
+CREATE OR REPLACE STAGE student_stage;
+
+CREATE OR REPLACE FILE FORMAT csv_header_format
+    TYPE = 'CSV'
+    PARSE_HEADER = TRUE
+    ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE;
+```
+
+> Upload `students.csv` to `@student_stage` using `PUT` (from SnowSQL) or the Snowsight UI upload button.
+
+### Step 4 — Full COPY INTO combining all five behaviors
+
+```sql
+COPY INTO students
+FROM @student_stage
+FILE_FORMAT = (FORMAT_NAME = 'csv_header_format')
+MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+FORCE = TRUE
+PURGE = TRUE;
+```
+
+### What happens here, step by step:
+
+1. `PARSE_HEADER = TRUE` reads `Name, Department, CGPA` as actual column headers (not data).
+2. `MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE` matches `Name` → `name`, `Department` → `department`, `CGPA` → `cgpa` — even though the table's column order is different from the file, and casing doesn't match.
+3. `ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE` means if a future file has one extra or missing column, the load still proceeds instead of erroring out.
+4. `FORCE = TRUE` ensures this file loads even if it was already loaded before (e.g., during testing/reruns).
+5. `PURGE = TRUE` deletes `students.csv` from `@student_stage` automatically once the load succeeds.
+
+### Verify
+
+```sql
+SELECT * FROM students;
+```
+
+Expected output:
+
+| DEPARTMENT | NAME | CGPA |
+|---|---|---|
+| CSE | Ananya | 8.9 |
+| ECE | Rahul | 8.4 |
+
+```sql
+LIST @student_stage;
+-- Returns 0 rows — file was purged after successful load
+```
+
+---
+
+## 🔑 Highlighted Takeaways
+
+- 📌 `MATCH_BY_COLUMN_NAME` + `PARSE_HEADER` is the standard combo for **header-driven, order-independent CSV loading** — very common in real pipelines where source systems don't guarantee column order.
+- 📌 When using CSV with schema evolution, `ERROR_ON_COLUMN_COUNT_MISMATCH` **must** be `FALSE` — Snowflake enforces this as a requirement, not just a suggestion.
+- 📌 `FORCE = TRUE` and `PURGE = TRUE` are **operationally risky** — use them in controlled, tested pipelines, not casually in production.
+- 📌 `PARSE_HEADER = TRUE` and `SKIP_HEADER` are **mutually exclusive** — never combine them.
+- 📌 Default value of `MATCH_BY_COLUMN_NAME` is `NONE` (pure positional loading) — you must explicitly opt into name-based matching.
+
+---
+
+## Interview Q&A
+
+**Q1. What's the difference between `MATCH_BY_COLUMN_NAME` and the default positional loading in COPY INTO?**
+> A: Positional loading (default, `NONE`) maps file column 1 → table column 1, and so on, regardless of names. `MATCH_BY_COLUMN_NAME` instead matches columns by their actual header names, so column order in the file doesn't need to match the table.
+
+**Q2. Why would `ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE` be required alongside `MATCH_BY_COLUMN_NAME` for CSV schema evolution?**
+> A: Because schema evolution assumes files may add/remove columns over time — if column-count mismatch strictly errors out by default, schema evolution could never trigger. Snowflake requires setting it to `FALSE` for this scenario to work.
+
+**Q3. What risk does `FORCE = TRUE` introduce?**
+> A: It bypasses Snowflake's duplicate-file load check, so re-running the same COPY command can insert the same data twice, creating duplicate rows.
+
+**Q4. What does `PURGE = TRUE` do, and why should it be used carefully?**
+> A: It automatically deletes source files from the stage after a successful load. It should be used carefully because it's irreversible — if you need to reprocess or audit that raw file later, it's gone.
+
+**Q5. Can `PARSE_HEADER = TRUE` be combined with `SKIP_HEADER`?**
+> A: No — they're mutually exclusive. `PARSE_HEADER` already consumes the header row to define column names, so `SKIP_HEADER` isn't compatible with it.
+
+**Q6. Is `PARSE_HEADER` a COPY INTO copy option or a file format option?**
+> A: It's a file format option, set either in `CREATE FILE FORMAT` or inline via `FILE_FORMAT = (...)` inside the COPY command — not a standalone copy option like `FORCE` or `PURGE`.
+
 ---
 
 # Part C — Cloud Integrations & Automated Ingestion
