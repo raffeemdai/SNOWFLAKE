@@ -1889,6 +1889,241 @@ By default, a stream becomes **stale** (unusable, history unrecoverable) after *
 ALTER TABLE employee_data SET MAX_DATA_EXTENSION_TIME_IN_DAYS = 20;
 ```
 
+# Snowflake Streams — Staleness (Theory, Solution & Examples)
+
+---
+
+## 1. What is a Stream, First? (Quick Refresher)
+
+A **Stream** is a Snowflake object that tracks DML changes (INSERT, UPDATE, DELETE) made to a table since the last time the stream was read. It doesn't store the actual changed data itself — it keeps an **offset** (a bookmark/pointer) on the source table's change history and shows you only what changed since that bookmark.
+
+```sql
+CREATE OR REPLACE STREAM my_stream ON TABLE my_table;
+```
+
+---
+
+## 2. What is Stream Staleness? (Theory)
+
+A stream becomes **stale** when its offset falls **outside** the data retention period of the source table — meaning the historical change data the stream needs to compute its delta no longer exists.
+
+### Why this happens
+
+Snowflake uses **Time Travel** internally to let a stream "look back" and compute what changed. Time Travel data is only kept for a limited window (the table's `DATA_RETENTION_TIME_IN_DAYS`, plus a possible temporary extension). If nobody consumes the stream for long enough, that retention window slides past the stream's bookmark — the reference point the stream needs is gone, and the stream can no longer reliably report what changed.
+
+## 3. Analogy 🎬
+
+Think of a stream like a **DVR recording a TV channel with limited storage** (say, 14 days of recording space).
+
+- If you watch (consume) the recording regularly, older footage gets replaced by new footage, and you're always caught up.
+- If you go on vacation for a month and don't watch anything, the DVR eventually **overwrites** the earliest episodes you never watched. When you come back, there's a gap — you can't watch what got erased.
+
+That gap is exactly what "stale" means for a stream: the changes that happened are gone, and the stream can no longer give you an accurate picture of everything that changed.
+
+---
+
+## 4. How Snowflake Signals Staleness
+
+| Command | What it shows |
+|---|---|
+| `DESCRIBE STREAM my_stream;` | Shows a `STALE_AFTER` timestamp and a `STALE` (true/false) column |
+| `SHOW STREAMS;` | Same info, across all streams |
+
+- `STALE_AFTER` = the predicted (or actual, if in the past) time the stream becomes/became stale. It's calculated as current timestamp + the larger of `DATA_RETENTION_TIME_IN_DAYS` or `MAX_DATA_EXTENSION_TIME_IN_DAYS`.
+- `STALE` = TRUE means the stream is *expected* to be stale — but it might not have actually failed yet. Don't treat "not stale yet" as a safety guarantee; the actual failure can happen at any point after `STALE_AFTER`.
+
+```sql
+DESCRIBE STREAM my_stream;
+-- Look at the STALE_AFTER and STALE columns in the output
+```
+
+---
+
+## 5. Solutions — How to Prevent Staleness
+
+### ✅ Solution 1 — Consume the stream regularly
+
+The most direct fix: read from the stream inside a DML statement (INSERT, MERGE, etc.) **before** `STALE_AFTER` is reached. Consuming the stream advances its offset, which resets the clock.
+
+```sql
+INSERT INTO target_table
+SELECT * FROM my_stream;
+-- This DML consumes the stream and moves its offset forward
+```
+
+### ✅ Solution 2 — Use `SYSTEM$STREAM_HAS_DATA` to avoid wasted/false triggers
+
+This function checks whether a stream currently has unconsumed change data — useful in a Task's `WHEN` clause to skip unnecessary runs, and simply calling it also helps prevent staleness (as long as the stream is empty and it returns FALSE).
+
+```sql
+SELECT SYSTEM$STREAM_HAS_DATA('my_stream');
+```
+
+> 🔑 **Gotcha:** If this returns `TRUE` even due to a false positive (e.g., all changes cancel out to zero net rows), you should still consume the stream in a DML operation anyway — skipping it can leave the stream vulnerable to staleness later.
+
+### ✅ Solution 3 — Increase `MAX_DATA_EXTENSION_TIME_IN_DAYS`
+
+Snowflake automatically extends the retention window (up to this parameter's max) to try to prevent staleness on its own — but this is a safety net, not a substitute for regular consumption.
+
+```sql
+ALTER TABLE my_table SET MAX_DATA_EXTENSION_TIME_IN_DAYS = 14;
+```
+
+### ✅ Solution 4 — Automate consumption with a Task
+
+Pair the stream with a **Task** that runs on a schedule, so nobody has to remember to consume it manually.
+
+```sql
+CREATE OR REPLACE TASK consume_stream_task
+  WAREHOUSE = my_wh
+  SCHEDULE = '5 MINUTE'
+  WHEN SYSTEM$STREAM_HAS_DATA('my_stream')
+AS
+  INSERT INTO target_table
+  SELECT * FROM my_stream;
+```
+
+### ❌ If it's already stale — the only fix is to recreate it
+
+Once genuinely stale, a stream cannot be "healed" — you must drop and recreate it (losing the old offset/history):
+
+```sql
+CREATE OR REPLACE STREAM my_stream ON TABLE my_table;
+```
+
+> ⚠️ Recreating means you lose track of changes between the old offset and now — plan for a reconciliation/full-reload step if that gap matters for your pipeline.
+
+---
+
+## 6. How to Use Streams — Full Simple Example
+
+### Step 1 — Create source table and a stream on it
+
+```sql
+CREATE OR REPLACE TABLE employees (
+    id INT,
+    name STRING,
+    salary NUMBER
+);
+
+CREATE OR REPLACE STREAM employees_stream ON TABLE employees;
+```
+
+### Step 2 — Make some changes
+
+```sql
+INSERT INTO employees VALUES (1, 'Ananya', 50000);
+INSERT INTO employees VALUES (2, 'Rahul', 55000);
+
+UPDATE employees SET salary = 60000 WHERE id = 2;
+
+DELETE FROM employees WHERE id = 1;
+```
+
+### Step 3 — Query the stream (before consuming, you can view it repeatedly)
+
+```sql
+SELECT * FROM employees_stream;
+```
+
+Example output:
+
+| ID | NAME | SALARY | METADATA$ACTION | METADATA$ISUPDATE |
+|---|---|---|---|---|
+| 1 | Ananya | 50000 | DELETE | FALSE |
+| 2 | Rahul | 55000 | DELETE | TRUE |
+| 2 | Rahul | 60000 | INSERT | TRUE |
+
+> 🔑 **Key theory point:** Snowflake represents every UPDATE internally as a DELETE + INSERT pair, linked by the same `METADATA$ROW_ID`. That's why row `id = 2` shows up twice.
+
+### Step 4 — Consume the stream into a target table (this advances the offset)
+
+```sql
+MERGE INTO employees_archive AS target
+USING employees_stream AS source
+ON target.id = source.id
+WHEN MATCHED AND source.METADATA$ACTION = 'DELETE' AND source.METADATA$ISUPDATE = FALSE THEN
+    DELETE
+WHEN MATCHED AND source.METADATA$ACTION = 'INSERT' AND source.METADATA$ISUPDATE = TRUE THEN
+    UPDATE SET target.salary = source.salary
+WHEN NOT MATCHED AND source.METADATA$ACTION = 'INSERT' THEN
+    INSERT (id, name, salary) VALUES (source.id, source.name, source.salary);
+```
+
+After this `MERGE` runs, `employees_stream`'s offset moves forward — querying it again returns **no rows** until new changes happen.
+
+---
+
+## 7. Stream Metadata Columns — Quick Reference
+
+| Column | Meaning |
+|---|---|
+| `METADATA$ACTION` | `INSERT` or `DELETE` |
+| `METADATA$ISUPDATE` | `TRUE` if this action is part of an UPDATE (a DELETE+INSERT pair); `FALSE` if it's a genuine standalone insert/delete |
+| `METADATA$ROW_ID` | Unique, immutable row identifier — links the DELETE and INSERT halves of an UPDATE together |
+
+| Operation you want to detect | Filter condition |
+|---|---|
+| Pure INSERT | `METADATA$ACTION = 'INSERT' AND METADATA$ISUPDATE = FALSE` |
+| UPDATE | `METADATA$ACTION = 'INSERT' AND METADATA$ISUPDATE = TRUE` |
+| Pure DELETE | `METADATA$ACTION = 'DELETE' AND METADATA$ISUPDATE = FALSE` |
+
+---
+
+## 8. 🔑 Highlighted Key Points
+
+- 📌 Staleness is about the **offset falling outside the retention window**, not about the stream "getting old" in a generic sense.
+- 📌 `STALE = TRUE` is a **prediction**, not a confirmed failure — but don't rely on a stream past its `STALE_AFTER` time regardless.
+- 📌 Consuming a stream **must happen inside a DML statement** — a plain `SELECT` alone does *not* advance the offset.
+- 📌 If `SYSTEM$STREAM_HAS_DATA` returns `TRUE`, consume it even if it turns out to be a false positive — skipping "empty-looking" runs is a common way teams accidentally let streams go stale.
+- 📌 A stale stream **cannot be repaired** — only recreated, which means losing the change history gap in between.
+- 📌 Recreating the underlying table (`CREATE OR REPLACE TABLE`) also stales any streams built on it, even if you were consuming regularly.
+- 📌 Streams on **shared tables/views** don't extend the retention period the same way — an extra risk factor in data-sharing scenarios.
+
+---
+
+## 9. Interview Questions & Answers
+
+**Q1. What does it mean for a Snowflake stream to become "stale"?**
+> A: It means the stream's offset (bookmark) has moved outside the data retention period of the source table, so the historical change data needed to compute the delta is no longer available via Time Travel.
+
+**Q2. What causes a stream to go stale?**
+> A: Not consuming the stream's change data (via DML) for longer than the table's data retention period plus any temporary extension Snowflake applies.
+
+**Q3. How can you check if a stream is stale or about to become stale?**
+> A: Run `DESCRIBE STREAM` or `SHOW STREAMS` and check the `STALE_AFTER` timestamp and `STALE` boolean column.
+
+**Q4. Does querying a stream with a plain SELECT advance its offset?**
+> A: No. The offset only advances when the stream is consumed inside a DML statement (INSERT, MERGE, etc.), not with a standalone SELECT.
+
+**Q5. What's the difference between `STALE = TRUE` and an actually failed/unusable stream?**
+> A: `STALE = TRUE` is a prediction that the stream is expected to be stale — it might still technically return results for a while after. You shouldn't rely on results past the `STALE_AFTER` timestamp regardless, since failure can happen at any point after that.
+
+**Q6. How do you fix a stream that has already gone stale?**
+> A: You can't repair it — you must drop and recreate it with `CREATE OR REPLACE STREAM`, which resets its offset and means you lose visibility into changes that happened during the gap.
+
+**Q7. What role does `SYSTEM$STREAM_HAS_DATA` play in preventing staleness?**
+> A: It checks whether the stream currently has unconsumed data. Calling it helps avoid staleness (when the stream is empty and it returns FALSE), and it's commonly used in a Task's `WHEN` clause to avoid unnecessary runs — but a `TRUE` result should still be consumed via DML even if it turns out to be a false positive.
+
+**Q8. Why does an UPDATE show up as two rows in a stream instead of one?**
+> A: Snowflake internally represents every UPDATE as a DELETE of the old row plus an INSERT of the new row, both sharing the same `METADATA$ROW_ID`. You distinguish this from a plain insert/delete using the `METADATA$ISUPDATE` flag.
+
+**Q9. Does recreating the source table affect an existing stream on it?**
+> A: Yes — running `CREATE OR REPLACE TABLE` on the source table invalidates and stales any streams built on it, even if those streams were being consumed regularly before.
+
+**Q10. What parameter controls how long Snowflake will automatically extend a table's retention to protect an unconsumed stream?**
+> A: `MAX_DATA_EXTENSION_TIME_IN_DAYS` — Snowflake temporarily extends retention up to this value to try to prevent staleness, but it's not a permanent substitute for actually consuming the stream.
+
+---
+
+## 10. One-Line Cheat Sheet
+
+- Stream = bookmark on table's change history, not a copy of the data
+- Stale = bookmark fell outside the retention window
+- Fix: consume regularly via DML, or automate with a Task
+- Already stale → must recreate, no repair option
+- UPDATE = DELETE + INSERT pair, linked by `METADATA$ROW_ID`
+
 ---
 
 ## 25. Tasks — Automating Workflows
