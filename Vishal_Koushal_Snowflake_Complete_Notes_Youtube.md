@@ -2333,6 +2333,308 @@ Traditional data sharing = ETL export → FTP transfer → import at the consume
 - Shared views **must be Secure Views** — standard views expose underlying base-table structure and cannot be shared.
 - Shared data updates are **instant** — any write to the provider's base table is immediately visible to consumer queries.
 
+
+# Snowflake Secure Data Sharing — Theory, Queries & Interview Prep
+
+---
+
+## 1. What is Secure Data Sharing? (Theory)
+
+Snowflake **Secure Data Sharing** lets you share selected database objects — databases, tables, dynamic tables, external tables, and secure views — from your account to another Snowflake account, **without physically copying or moving any data**.
+
+## Analogy 🎬
+
+Think of Google Drive/Dropbox file sharing — you don't email someone a copy of your file; you just grant them a **link/permission** to view your existing file. Snowflake data sharing works the same way, except with the added enterprise-grade security and governance a data warehouse needs.
+
+---
+
+## 2. How It Actually Works (Theory)
+
+- No data is copied or transferred between provider and consumer accounts.
+- Sharing works entirely through **Snowflake's metadata layer** — the consumer's queries read directly from the provider's underlying storage.
+- Because nothing is copied, setup is **near-instant** — the consumer can query shared data almost immediately after being granted access.
+- Only **read-only** access is granted — consumers can never run INSERT, UPDATE, DELETE, MERGE, COPY INTO, or create stages/pipes on shared objects.
+
+> 🔑 **Highlight:** Even Snowflake's own built-in `SNOWFLAKE` and `SNOWFLAKE_SAMPLE_DATA` databases that appear in every new account are themselves examples of Snowflake sharing data with you.
+
+---
+
+## 3. Core Terminology
+
+| Term | Meaning |
+|---|---|
+| **Provider** | The account that owns the data and creates a share to give others access. Provider bears the **storage cost** always. |
+| **Consumer** | The account that receives access to the share and queries the data. |
+| **Share** | A named Snowflake object that bundles together which database objects are shared and which accounts can access them. |
+| **Reader Account** | A special account created and owned by the provider, used to share data with people/companies who don't have their own Snowflake account. |
+
+---
+
+## 4. Who Pays What? (Very Common Interview/Exam Point)
+
+| Scenario | Storage Cost | Compute Cost |
+|---|---|---|
+| Sharing with another **existing Snowflake account** | Provider | **Consumer** (only when they query) |
+| Sharing with a **Reader Account** | Provider | **Provider** (fully — reader account has no billing of its own) |
+
+> 🔑 **Highlight:** This is one of the most commonly tested facts. Direct account-to-account sharing splits the cost — storage stays with the provider, compute shifts to whoever runs the query. But Reader Accounts flip that: the provider pays for **both**, since a reader account isn't a paying Snowflake customer.
+
+---
+
+## 5. Direct Share vs Listing vs Replication
+
+| Method | When to use |
+|---|---|
+| **Direct Share** | Same cloud + same region, sharing with an existing or reader account. Instant, simplest. |
+| **Listing / Marketplace** | Publishing data more broadly, or to a defined list of consumers — requires a full (non-trial) Snowflake account with billing set up. |
+| **Replication** | Needed when provider and consumer are on **different clouds or different regions** — direct share does not work cross-cloud/cross-region. |
+
+> 🔑 **Highlight:** Direct share **only** works within the same cloud + region. Cross-cloud or cross-region sharing **requires replication** first.
+
+---
+
+## 6. What Can Be Shared
+
+- ✅ Databases
+- ✅ Tables
+- ✅ Dynamic Tables
+- ✅ External Tables
+- ✅ Views — but **only Secure Views** (regular/non-secure views cannot be shared)
+
+---
+
+## 7. Step-by-Step: Direct Share with an Existing Account (SQL)
+
+```sql
+-- Step 1: Create an empty share
+CREATE SHARE sales_share;
+
+-- Step 2: Grant access to the database/objects you want to include
+GRANT USAGE ON DATABASE sales_db TO SHARE sales_share;
+GRANT USAGE ON SCHEMA sales_db.public TO SHARE sales_share;
+GRANT SELECT ON TABLE sales_db.public.orders TO SHARE sales_share;
+GRANT SELECT ON TABLE sales_db.public.customers TO SHARE sales_share;
+
+-- Step 3: Add the consumer account(s) to the share
+ALTER SHARE sales_share ADD ACCOUNTS = 'xy12345', 'yz23456';
+```
+
+### Consumer side — create a database from the share
+
+```sql
+CREATE DATABASE sales_shared_db FROM SHARE provider_account.sales_share;
+
+-- Grant a role access to query it
+GRANT IMPORTED PRIVILEGES ON DATABASE sales_shared_db TO ROLE analyst_role;
+```
+
+---
+
+## 8. Step-by-Step: Sharing With a Reader Account (SQL)
+
+This mirrors exactly what was demonstrated in the video — creating a reader account, sharing data with it, and testing its restrictions.
+
+### Step 1 — Create the Reader Account (provider side, needs ACCOUNTADMIN)
+
+```sql
+CREATE MANAGED ACCOUNT reader_acct
+  ADMIN_NAME = reader_admin,
+  ADMIN_PASSWORD = 'StrongPassword123',
+  TYPE = READER;
+
+-- Get the account locator/URL for the new reader account
+SHOW MANAGED ACCOUNTS;
+```
+
+### Step 2 — Create a share and grant objects to it
+
+```sql
+CREATE SHARE reader_data_share;
+
+GRANT USAGE ON DATABASE youtube_learning TO SHARE reader_data_share;
+GRANT USAGE ON SCHEMA youtube_learning.raw_layer TO SHARE reader_data_share;
+GRANT SELECT ON ALL TABLES IN SCHEMA youtube_learning.raw_layer TO SHARE reader_data_share;
+GRANT SELECT ON VIEW youtube_learning.raw_layer.customer_secure_vw TO SHARE reader_data_share;
+```
+
+### Step 3 — Add the reader account to the share
+
+```sql
+ALTER SHARE reader_data_share ADD ACCOUNTS = 'READER_ACCT_LOCATOR';
+```
+
+### Step 4 — Inside the reader account: create a database from the share and set up a role/warehouse
+
+```sql
+CREATE OR REPLACE DATABASE reader_shared_db
+  FROM SHARE provider_account.reader_data_share;
+
+USE ROLE SECURITYADMIN;
+CREATE ROLE reader_role;
+GRANT IMPORTED PRIVILEGES ON DATABASE reader_shared_db TO ROLE reader_role;
+
+CREATE WAREHOUSE reader_wh WITH WAREHOUSE_SIZE = 'XSMALL';
+GRANT USAGE ON WAREHOUSE reader_wh TO ROLE reader_role;
+
+GRANT ROLE reader_role TO USER reader_user;
+```
+
+### Step 5 — Query the shared data as the reader
+
+```sql
+USE ROLE reader_role;
+SELECT * FROM reader_shared_db.raw_layer.aws_customer_load;
+```
+
+### Step 6 — Confirm read-only restriction (this will fail, as demonstrated)
+
+```sql
+DELETE FROM reader_shared_db.raw_layer.aws_customer_load;
+-- Error: Operation is not supported in reader account
+
+TRUNCATE TABLE reader_shared_db.raw_layer.aws_customer_load;
+-- Error: Insufficient privilege to operate on table
+```
+
+> 🔑 **Highlight:** A reader account can only ever consume data from the **one provider account** that created it — it's permanently tied to that provider, unlike a regular consumer account which could theoretically receive shares from multiple different providers.
+
+---
+
+## 9. Reader Account Restrictions — Quick Reference
+
+| Action | Allowed? |
+|---|---|
+| SELECT | ✅ Yes |
+| INSERT / UPDATE / DELETE / MERGE | ❌ No |
+| COPY INTO | ❌ No |
+| CREATE STAGE / CREATE PIPE | ❌ No |
+| Data Metric Functions | ❌ No |
+
+---
+
+## 10. Controlling Reader Account Costs
+
+Since the provider pays for **all** compute used by a reader account, providers commonly attach a **Resource Monitor** to cap how many credits a reader account (or its warehouse) can consume — preventing runaway costs from an external consumer's queries.
+
+---
+
+## 11. 🔑 Highlighted Key Points (Summary)
+
+- 📌 Data sharing never copies data — it's entirely metadata-driven.
+- 📌 Shared objects are **always read-only** for the consumer.
+- 📌 Only **secure views** can be shared — plain views cannot.
+- 📌 Direct share requires **same cloud + same region**; anything else needs replication.
+- 📌 Consumer pays compute in a normal share; **provider pays both storage and compute** for a reader account.
+- 📌 A reader account can only ever consume from the one provider that created it.
+- 📌 Publishing to the Snowflake Marketplace requires a paid/organization account — not available on trial accounts.
+- 📌 Resource Monitors are the standard way to cap a reader account's credit usage.
+
+---
+
+## 12. Interview Questions & Answers
+
+**Q1. What is Snowflake Secure Data Sharing?**
+> A: A feature that lets a provider account share selected database objects (databases, tables, dynamic/external tables, secure views) with another account without physically copying the data — access is granted through Snowflake's metadata layer.
+
+**Q2. Is any data actually moved when you share it in Snowflake?**
+> A: No. No data is copied or transferred between accounts. The consumer's queries read directly against the provider's storage through shared metadata.
+
+**Q3. Can a consumer modify shared data?**
+> A: No. All shared objects are strictly read-only — no INSERT, UPDATE, DELETE, MERGE, or COPY INTO is possible on shared data.
+
+**Q4. What types of views can be shared?**
+> A: Only **secure views**. Regular (non-secure) views cannot be included in a share.
+
+**Q5. Who pays for storage and compute in a standard direct share (account-to-account)?**
+> A: The provider always pays storage. The consumer pays compute — but only when they actually run queries against the shared data.
+
+**Q6. Who pays for storage and compute when sharing with a Reader Account?**
+> A: The provider pays for **both** storage and compute. Reader accounts have no billing relationship with Snowflake of their own.
+
+**Q7. What is a Reader Account, and when would you use one?**
+> A: A reader account (formerly called a read-only account) is created and owned by a provider to let someone without their own Snowflake account query shared data — for example, a prospective customer evaluating Snowflake before committing to their own account.
+
+**Q8. Can a reader account access data from multiple different provider accounts?**
+> A: No. A reader account can only ever consume data from the single provider account that created it.
+
+**Q9. Does Direct Share work across different clouds or regions?**
+> A: No. Direct share only works within the same cloud and same region. Cross-cloud or cross-region sharing requires setting up replication first.
+
+**Q10. How can a provider limit how many credits a reader account consumes?**
+> A: By attaching a Resource Monitor, which caps credit usage (e.g., limiting it to 50 or 100 credits) so the reader account's queries can't run up unbounded compute costs on the provider's bill.
+
+**Q11. What SQL commands are used to build and share a direct share, in order?**
+> A: `CREATE SHARE` → `GRANT <privilege> ... TO SHARE` (to add database/schema/table access) → `ALTER SHARE ... ADD ACCOUNTS` (to add consumer accounts).
+
+**Q12. What must a consumer do to actually query data granted through a share?**
+> A: Run `CREATE DATABASE ... FROM SHARE <provider_account>.<share_name>` to materialize a local read-only database from the share, then grant a role `IMPORTED PRIVILEGES` on that database.
+
+---
+
+## 13. One-Line Cheat Sheet
+
+- Data Sharing = metadata pointer, not a data copy
+- Shared objects = always read-only
+- Only secure views can be shared
+- Same cloud + region → Direct Share; otherwise → Replication
+- Normal share: provider pays storage, consumer pays compute
+- Reader account: provider pays storage **and** compute
+- Reader account = permanently tied to one provider only
+
+---
+
+## 14. Video Summary — Additional Notes
+
+### No Data Copying or Transferring
+
+- **Traditional (pre-Snowflake) approach:** running ETL exports, transferring CSV files over FTP, and importing them into the consumer's database — a slow, duplicated, storage-heavy process.
+- **In Snowflake:** no actual data is copied or transferred at all.
+- Sharing is managed entirely via **metadata pointers in the Cloud Services layer**. The consumer queries the provider's **active micro-partitions in real time** — there's no lag caused by data movement, because none happens.
+- Shared databases are strictly **read-only** in the consumer's environment.
+
+> 🔑 **Highlight:** This reframes *why* Snowflake sharing feels instant compared to older ETL/FTP-based approaches — it's not a faster copy mechanism, it's the complete absence of a copy step.
+
+### Cost Allocation (Direct Share)
+
+| Cost Type | Who Pays |
+|---|---|
+| **Storage** | 100% **Provider** — consumer pays **$0** for storage |
+| **Compute** | 100% **Consumer** — uses their own virtual warehouse and their own credits to query the shared data |
+
+### Direct Shares vs. Reader Accounts — Reframed
+
+| | Direct Share | Reader Account |
+|---|---|---|
+| **When used** | Consumer already has a Snowflake account, in the **same cloud and region** | Consumer has **no** Snowflake account at all |
+| **What it is** | Access granted to an existing account | Provider creates a lightweight, read-only account *for* the consumer |
+| **Storage cost** | Provider | Provider |
+| **Compute cost** | Consumer | **Provider** (the "Reader Account Cost Catch") |
+
+> 🔑 **Highlight — "The Reader Account Cost Catch":** Because the provider foots the bill for both storage AND compute on a reader account, providers must set up **strict Resource Monitors** on the reader account's virtual warehouses — otherwise an active/misbehaving reader-side query can silently drain the provider's own credits.
+
+### Security & Share Rules — Reframed
+
+- Shared views **must be Secure Views**. Standard (non-secure) views cannot be added to a share, because a regular view would expose its underlying base table/schema definition to the consumer — a security leak Snowflake explicitly blocks.
+- Shared databases are **instantly updated** — there is no batch delay. Any write or append made to the provider's base table is **immediately visible** to the consumer's next query, since the consumer is reading the same live micro-partitions, not a stale snapshot.
+
+> 🔑 **Highlight:** This "instant visibility" point is a great way to explain *why* secure views matter so much — since the consumer is seeing live data with zero lag, any accidental logic leak in a non-secure view's definition would be exposed in real time too.
+
+### Extra Interview Q&A (From This Summary)
+
+**Q13. How did data sharing typically work before platforms like Snowflake, and why is that a problem?**
+> A: Traditionally, sharing meant running ETL exports, transferring files (e.g., CSV) over FTP, and importing them into the consumer's own database — a slow process that duplicates storage and quickly goes stale.
+
+**Q14. At what architectural layer does Snowflake manage data sharing?**
+> A: The **Cloud Services layer**, using metadata pointers — the consumer's queries read the provider's active micro-partitions directly, rather than a copied dataset.
+
+**Q15. If a provider updates a shared table, how quickly does the consumer see the change?**
+> A: Immediately. Since the consumer queries the same live micro-partitions as the provider, any write or append is instantly visible — there's no replication delay for direct shares.
+
+**Q16. Why can't a standard (non-secure) view be shared?**
+> A: Because a standard view exposes its underlying SQL definition and base schema to anyone who can see it — sharing it would leak internal table structure to the consumer. Secure views hide that definition, which is why only secure views are shareable.
+
+**Q17. What operational safeguard should a provider always set up when using Reader Accounts, and why?**
+> A: A Resource Monitor on the reader account's warehouse(s) — because the provider pays 100% of the compute costs generated by the reader account's queries, an unmonitored reader account could run up unexpectedly high credit consumption on the provider's bill.
 ---
 
 # Part E — Cost Governance, Advanced Loading & Modern Pipelines
