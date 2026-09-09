@@ -3164,6 +3164,22 @@ CREATE OR REPLACE DYNAMIC TABLE daily_sales_summary
   FROM orders_base
   GROUP BY customer_name, order_date;
 ```
+| Parameter      | Default                                              |
+| -------------- | ---------------------------------------------------- |
+| `REFRESH_MODE` | `AUTO`                                               |
+| `INITIALIZE`   | `ON_CREATE`                                          |
+| `SCHEDULER`    | Enabled / Snowflake-managed by default               |
+| `TARGET_LAG`   | No default — you normally specify it                 |
+| `WAREHOUSE`    | No default — must be specified for scheduled refresh |
+
+
+CREATE OR REPLACE DYNAMIC TABLE customer_dt
+    TARGET_LAG = '10 minutes'    
+    WAREHOUSE = compute_wh    
+AS
+SELECT *
+FROM customer;
+
 
 ---
 
