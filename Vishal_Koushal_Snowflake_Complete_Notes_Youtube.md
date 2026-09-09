@@ -3213,6 +3213,29 @@ CREATE OR REPLACE DYNAMIC TABLE customer_scd2
     NVL(raw_end_date, '9999-12-31'::TIMESTAMP) AS end_date,
     CASE WHEN raw_end_date IS NULL THEN TRUE ELSE FALSE END AS is_active
   FROM next_changes;
+
+
+INSERT INTO CUSTOMER_SRC VALUES
+(1, 'John', 'Atlanta', '2026-09-01 10:00:00'),
+(1, 'John', 'New York', '2026-09-05 10:00:00'),
+(2, 'Mary', 'Chicago', '2026-09-02 10:00:00');
+
+CUSTOMER_ID  NAME   CITY       START_DATE           END_DATE             IS_CURRENT
+1            John   Atlanta    2026-09-01 10:00     2026-09-05 10:00     N
+1            John   New York   2026-09-05 10:00     NULL                 Y
+2            Mary   Chicago    2026-09-02 10:00     NULL                 Y
+
+LEAD(UPDATED_AT)
+        |
+        v
+Find next version date
+        |
+        +--> exists     -> old record -> IS_CURRENT = N
+        |
+        +--> not exists -> latest     -> IS_CURRENT = Y
+
+
+
 ```
 
 ### 40.3 Building SCD Type 1 on Top of SCD Type 2
