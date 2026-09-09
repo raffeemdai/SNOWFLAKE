@@ -3196,23 +3196,39 @@ Standard SCD Type 2 (Section 35) requires multiple merge statements, task DAGs, 
 - Flag `IS_ACTIVE` based on whether `END_DATE` equals that sentinel date.
 
 ```sql
-CREATE OR REPLACE DYNAMIC TABLE customer_scd2
-  TARGET_LAG = '1 MINUTE'
-  WAREHOUSE = COMPUTE_WH
-  AS
-  WITH next_changes AS (
+CREATE OR REPLACE DYNAMIC TABLE CUSTOMER_SCD2
+TARGET_LAG = '1 minute'
+WAREHOUSE = COMPUTE_WH
+AS
+
+WITH CTE AS (
     SELECT
-      customer_id, customer_name, city, email, phone,
-      updated_at AS start_date,
-      LEAD(updated_at) OVER (PARTITION BY customer_id ORDER BY updated_at) AS raw_end_date
-    FROM customer_stage
-  )
-  SELECT
-    customer_id, customer_name, city, email, phone,
-    start_date,
-    NVL(raw_end_date, '9999-12-31'::TIMESTAMP) AS end_date,
-    CASE WHEN raw_end_date IS NULL THEN TRUE ELSE FALSE END AS is_active
-  FROM next_changes;
+        CUSTOMER_ID,
+        NAME,
+        CITY,
+        UPDATED_AT AS START_DATE,
+
+        LEAD(UPDATED_AT) OVER (
+            PARTITION BY CUSTOMER_ID
+            ORDER BY UPDATED_AT
+        ) AS END_DATE
+
+    FROM CUSTOMER_SRC
+)
+
+SELECT
+    CUSTOMER_ID,
+    NAME,
+    CITY,
+    START_DATE,
+    END_DATE,
+
+    CASE
+        WHEN END_DATE IS NULL THEN 'Y'
+        ELSE 'N'
+    END AS IS_CURRENT
+
+FROM CTE;
 
 
 INSERT INTO CUSTOMER_SRC VALUES
